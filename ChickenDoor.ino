@@ -43,16 +43,17 @@ const time_t LoopPeriod = 180;              // Number of seconds between checks
 Adafruit_BME280 bme;                        // The class that controls the BME280 sensor
 bool Bme280Present = true;                  // Initialize/use the BME280 or not
 volatile time_t previousCheckAt = 0;
-float temperature;                          // Can be used for deciding if the door should be used
+float temperature;
 float humidity;                             // Informational
 float pressure;                             // Informational
 
 // Open and closing times
-const uint8_t MinutesBeforeRiseClose = 50;  // The number of minutes before sunset we close the coop
+const uint8_t MinutesBeforeRiseClose = 75;  // The number of minutes before sunset we close the coop
 const uint8_t HourOpen = 6;                 // The time the chickens may leave the coop
 const uint8_t MinuteOpen = 59;
 const uint8_t WeekendHourOpen = 7;          // The time the chickens may leave the coop in the weekend
 const uint8_t WeekendMinuteOpen = 15;
+time_t closingTime = 0;                     // The time the door will close today
 
 // For the Wifi connection. Replace with your network credentials
 const char* ssid = "REPLACE_WITH_YOUR_SSID";
@@ -72,11 +73,12 @@ String header;
 const unsigned int localPort = 2390;        // Local port to listen for UDP packets
 IPAddress timeServer(129, 6, 15, 28);       // time.nist.gov NTP server
 const int NtpPacketSize = 48;               // NTP time stamp is in the first 48 bytes of the message
-const time_t UpdateTimeTimeout = 120;       // Time (in seconds) we will retry updating the clock
+const time_t UpdateTimeTimeout = 120;       // Time (in seconds) we will try updating the clock
 
 byte packetBuffer[NtpPacketSize];           // Buffer to hold incoming and outgoing packets
 time_t updateTimeStarted;                   // The time when we started updating the clock
 bool ntpTimeSet = false;                    // Has the time been set through NTP?
+bool emailSent = false;                     // Has an email been sent because setting the time failed?
 int lastSecond = -1;                        // The second we last did stuff for NTP
 bool settingSunRiseSunSet = false;          // True when setting the sunrise and sunset
 
@@ -99,8 +101,11 @@ WiFiUDP Udp;
 #define DIR_DELAY 1000                      // Brief delay for abrupt motor changes
 
 // Stuff related to controlling the motor
-const time_t DefMoveMillis = 12500;         // The default duration of a move.
-const time_t MaxMoveMillis = 15000;         // If moving the door takes longer than this perform a retry.
+const time_t DefMoveUpMillis = 12750;       // The default duration of an up move.
+const time_t DefMoveDownMillis = 12500;     // The default duration of a down move.
+const time_t MaxMoveMillis = 14000;         // If moving the door takes longer than this perform a try.
+const time_t ClearSensorMillis = 140;       // The duration of a move used for clearing a sensor.
+const int MaxAttempts = 1;                  // Number of times the move should be retried
 
 enum Direction {
   DownDir,
@@ -126,8 +131,8 @@ Command webCommand = NoCmd;
 
 // For sunrise and sunset
 sunMoon sm;
-time_t sRise = 0;
-time_t sSet = 0;
+time_t sunRise = 0;
+time_t sunSet = 0;
 
 // Stuff related to the state machine controlling the door
 enum StateMachineState
@@ -135,23 +140,25 @@ enum StateMachineState
   NotRunning = 0,
   Initial = 1,
   Up = 2,
-  MovingDown = 3,
-  Down = 4,
-  MovingUp = 5,
-  MovingDownFailed = 6,
-  MovingUpFailed = 7,
-  Moving1Sec = 8,
-  Alarm = 9,
+  ClearingSensor = 3,
+  MovingDown = 4,
+  Down = 5,
+  MovingUp = 6,
+  MovingDownFailed = 7,
+  MovingUpFailed = 8,
+  Moving1Sec = 9,
+  Alarm = 10
 };
 
 enum StateMachineState stateMachineState = NotRunning;
 enum StateMachineState previousStateMachineState = NotRunning;
 enum StateMachineState prevState = NotRunning;                  // Used for returning to the previous state when moving 1 second
 bool stateChanged = true;  // Start with entry code
-int retry = 0;
+int attempt = 0;
 
 bool lowerSensorDetected = false;
 bool upperSensorDetected = false;
+bool upperSensorCleared = false;
 bool previousLowerSensorDetected = false;
 bool previousUpperSensorDetected = false;
 unsigned long startMovingMillis = 0;
@@ -476,17 +483,16 @@ void handleWebClient() {
 
             client.print("<p>Today's sunrise and sunset: ");
             sprintf(buf, "%2d-%02d-%4d %02d:%02d:%02d",
-              day(sRise), month(sRise), year(sRise), hour(sRise), minute(sRise), second(sRise));
+              day(sunRise), month(sunRise), year(sunRise), hour(sunRise), minute(sunRise), second(sunRise));
             client.print(buf);
             client.print(", ");
             sprintf(buf, "%2d-%02d-%4d %02d:%02d:%02d",
-              day(sSet), month(sSet), year(sSet), hour(sSet), minute(sSet), second(sSet));
+              day(sunSet), month(sunSet), year(sunSet), hour(sunSet), minute(sunSet), second(sunSet));
             client.print(buf);
             client.println("</p>");
 
             client.print("<p>Today's closing time: ");
-            sprintf(buf, "%02d:%02d",
-              hour(sRise - MinutesBeforeRiseClose * 60), minute(sRise - MinutesBeforeRiseClose * 60));
+            sprintf(buf, "%02d:%02d", hour(closingTime), minute(closingTime));
             client.print(buf);
             client.println("</p>");
 
@@ -592,15 +598,39 @@ void stopBuzzer() {
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-void setSunriseSunset() {
+// Calculate the next sunrise and sunset and time for closing the door
+void setSunriseSunsetClosingTime() {
   // Initialize sunMoon
   sm.init(Timezone, Latitude, Longitude);
-  sRise = sm.sunRise();
-  sSet = sm.sunSet();
+  sunRise = sm.sunRise();
+  sunSet = sm.sunSet();
   Serial.print("Today's sunrise and sunset: ");
-  printDateTime(sRise);
+  printDateTime(sunRise);
   Serial.print(", ");
-  printDateTime(sSet);
+  printDateTime(sunSet);
+  Serial.println();
+
+  // The time for closing the door is <MinutesBeforeRiseClose> before sunset 
+  // or opening time, whichever comes first.
+  tmElements_t openingTimeElements;
+  if (dayOfWeek(now()) > 1 && dayOfWeek(now()) < 7) {
+    openingTimeElements = {second(), MinuteOpen, HourOpen, weekday(), day(), month(), year() - 1970 };
+  }
+  else {
+    openingTimeElements = {second(), WeekendMinuteOpen, WeekendHourOpen, weekday(), day(), month(), year() - 1970 };
+  }
+  time_t openingTime = makeTime(openingTimeElements);
+
+  if (openingTime < sunRise) {
+    Serial.println("The time for opening is before sunset.");
+    closingTime = openingTime - (MinutesBeforeRiseClose * 60);
+  }
+  else {
+    closingTime = sunRise - (MinutesBeforeRiseClose * 60);
+  }
+  
+  Serial.print("Closing the door today at: ");
+  printDateTime(closingTime);
   Serial.println();
 }
 
@@ -642,14 +672,14 @@ void sendEmail(int message) {
     mail.setBody("The clock could not be set.");
   }
   else if (message == 2) {
-    mail.setBody("The chicken door was sent down 3 times but it failed.");
+    mail.setBody("The chicken door was sent down MaxAttempts times but it failed.");
   }
   else if (message == 3) {
-    mail.setBody("The chicken door was sent up 3 times but it failed.");
+    mail.setBody("The chicken door was sent up MaxAttempts times but it failed.");
   }
   //mail.setHTMLBody("This is an example html <b>e-mail<b/>.\n<u>Regards</u>");
   
-  if (mail.send("smtp.sendgrid.net", 587, "apikey", apikey) == 0) {
+  if (mail.send("smtp.sendgrid.net", 587, "apikey", "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") == 0) {
     Serial.println("Mail sent OK");
   }
   else {
@@ -682,7 +712,7 @@ void loop() {
           setTime(epoch + Timezone * 60);
           ntpTimeSet = true;
 
-          setSunriseSunset();
+          setSunriseSunsetClosingTime();
 
           // Time was set, start the state machine for the door
           stateMachineState = Initial;
@@ -693,9 +723,12 @@ void loop() {
       lastSecond = second();
     }
     else if (now() > updateTimeStarted + UpdateTimeTimeout) {
-      // No time packet was received, send a warning email
-      sendEmail(1);
-      ntpTimeSet = true;  // Fake setting the time to prevent resend of email
+      // No time packet was received, send a warning email once.
+      // Chances are the internet connection is down anyway.
+      if (!emailSent) {
+        emailSent = true;
+        sendEmail(1);
+      }
     }
   }
   else {
@@ -706,6 +739,7 @@ void loop() {
       Serial.println();
       ntpTimeSet = false;
       updateTimeStarted = now();
+      emailSent = false;
 
       // Stop running the state machine, make sure it only runs on a correct clock
       stateMachineState = NotRunning;
@@ -726,14 +760,14 @@ void loop() {
 
   time_t t_now = now();   // The number of seconds since Jan 1 1970
 
-  // Every day, a little after midnight, calculate the next sunrise and sunset
+  // Every day, a little after midnight, calculate the next sunrise and sunset and time for closing the door
   if (!settingSunRiseSunSet && hour() == 0 && minute() == 5 && second() == 0) {
     settingSunRiseSunSet = true;
     Serial.println("Calculating sunrise and sunset at ");
     printDateTime(t_now);
     Serial.println();
 
-    setSunriseSunset();
+    setSunriseSunsetClosingTime();
   }
   else if (settingSunRiseSunSet && second() != 0) {
     settingSunRiseSunSet = false;
@@ -777,17 +811,17 @@ void loop() {
     // Transitions
     if (!stateChanged) {
       // Use the sensors to initialize the state machine
-      if (upperSensorDetected) {
+      if (UseUpperSensor && upperSensorDetected) {
         stateMachineState = Up;
       }
-      else if (lowerSensorDetected) {
+      else if (UseLowerSensor && lowerSensorDetected) {
         stateMachineState = Down;
       }
       else if (!UseUpperSensor) {
-        stateMachineState = Up;
+        stateMachineState = Up; // Assume it's in the Up position
       }
       else {
-        stateMachineState = MovingUp;
+        stateMachineState = MovingUp; // Start the move to the Up position
       }
     }
     break;
@@ -807,24 +841,48 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
+      // Move down a little bit so the sensor won't be triggered all the time
+      if (upperSensorDetected && !upperSensorCleared) {
+        stateMachineState = ClearingSensor;
+        upperSensorCleared = true;  // Clear the sensor only once
+      }      
       // Close the door if the temperature goes below the treshold and it is night OR
       // when it is just before sunset and we want to keep the chicken inside a bit longer
-      if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sSet || t_now < sRise) && (retry < 3)) ||
-          (UseClock && (t_now > sRise - MinutesBeforeRiseClose * 60) && (t_now < sRise) && (retry < 3)) ||
-          webCommand == DownCmd)
+      else if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sunSet || t_now < sunRise) && (attempt < MaxAttempts)) ||
+               (UseClock && (t_now >= closingTime) && (t_now < closingTime + 4) && (attempt < MaxAttempts)) ||
+               webCommand == DownCmd)
       {
         webCommand = NoCmd;
         stateMachineState = MovingDown;
+        upperSensorCleared = false;
       }
       else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
         prevState = Up;
         stateMachineState = Moving1Sec;
       }
+      // Wait until the next day before resetting attempt
+      else if (t_now > sunRise && t_now < sunSet && attempt > 0) {
+        attempt = 0;
+      }
+    }
+    break;
 
-      /* Wait until the next day before resetting retry */
-      else if (t_now > sRise && t_now < sSet && retry > 0) {
-        retry = 0;
-        stateMachineState = Initial;
+  //==============================================================
+  //  State 'ClearingSensor' 
+  //==============================================================
+  case ClearingSensor:
+
+    // Actions on entry
+    if (stateChanged) {
+      Serial.println("State: ClearingSensor");
+      moveDoor(Slow, DownDir);
+    }
+
+    // Continuous actions
+
+    // Transitions
+    if (!stateChanged) {
+      if (!upperSensorDetected) {
         stateMachineState = Up;
       }
     }
@@ -850,8 +908,8 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
-      if ((UseLowerSensor && !lowerSensorDetected) ||
-          (!UseLowerSensor && millis() - startMovingMillis > DefMoveMillis) ||
+      if ((UseLowerSensor && lowerSensorDetected) ||
+          (!UseLowerSensor && (millis() - startMovingMillis > DefMoveDownMillis)) ||
           (webCommand == StopCmd))
       {
         webCommand = NoCmd;
@@ -879,7 +937,7 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
-      if ((UseTemperature && ((temperature > ClosingTemperature) || (t_now > sRise && t_now < sSet))) ||
+      if ((UseTemperature && ((temperature > ClosingTemperature) || (t_now > sunRise && t_now < sunSet))) ||
           (UseClock && (dayOfWeek(now()) > 1) && (dayOfWeek(now()) < 7) && (hour() == HourOpen) && (minute() == MinuteOpen)) || 
           (UseClock && (dayOfWeek(now()) == 1 || dayOfWeek(now()) == 7) && (hour() == WeekendHourOpen) && (minute() == WeekendMinuteOpen)) ||
           (webCommand == UpCmd))
@@ -911,8 +969,8 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
-      if (upperSensorDetected ||
-          (!UseUpperSensor && millis() - startMovingMillis > DefMoveMillis) ||
+      if ((UseUpperSensor && upperSensorDetected) ||
+          (!UseUpperSensor && (millis() - startMovingMillis > DefMoveUpMillis)) ||
           (webCommand == StopCmd))
       {
         webCommand = NoCmd;
@@ -934,7 +992,7 @@ void loop() {
       Serial.println("State: MovingDownFailed");
       stopBuzzer();
       moveDoor(Stop, DownDir);
-      retry++;
+      attempt++;
     }
 
     // Continuous actions
@@ -956,14 +1014,14 @@ void loop() {
     if (stateChanged) {
       Serial.println("State: MovingUpFailed");
       moveDoor(Stop, DownDir);
-      retry++;
+      attempt++;
     }
 
     // Continuous actions
 
     // Transitions
     if (!stateChanged) {
-      if (retry > 3) {
+      if (attempt > MaxAttempts) {
         stateMachineState = Alarm;
       }
       else {
