@@ -22,7 +22,7 @@ What I also included in the software was:
 
 For my first experiments, I used a DC motor I took from an old printer and a small motor driver. I stuck all the parts I thought I would need on a breadboard and started making the software. Here a photo of this experimental setup:
 
-![Experimenting](https://github.com/Tsjakka/ChickenCoop/blob/master/Photos/IMG_20200528_203406210.jpg)
+![Experimenting](https://github.com/Tsjakka/ChickenCoop/blob/master/Photos/IMG_20200118_175027487.jpg)
 
 This worked very well for creating and testing the software. But this motor is absolutely too weak for lifting the actual door of the chicken coop, which is a triplex board of 300 x 200 x 4 mm. For this I found a motor with a built-in transmission and a really high torque that can be run on 12V.
 The second important element is a microcontroller to control the system. I selected an ESP8285 for this task and it works very well. It is also extremely cheap, just a few euros on the well known Chinese websites. I used the Arduino development environment to write the software. It's not the best IDE, but it's free and does the job.
