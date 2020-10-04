@@ -16,7 +16,9 @@ Before I started writing code, I made a state machine diagram that captures the 
 
 What I also included in the software was:
 * A Wi-Fi client that connects the system to the internet.
-* A web server serving up a page that allows me to move the door up and down.* An NTP client that reads the current time from the internet.* Code for reading the temperature from a Bosch BME280 weather sensor.
+* A web server serving up a page that allows me to move the door up and down.
+* An NTP client that reads the current time from the internet.
+* Code for reading the temperature from a Bosch BME280 weather sensor.
 
 # The hardware
 
