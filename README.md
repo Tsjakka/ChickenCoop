@@ -16,14 +16,22 @@ Before I started writing code, I made a state machine diagram that captures the 
 
 What I also included in the software was:
 * A Wi-Fi client that connects the system to the internet.
-* A web server serving up a page that allows me to move the door up and down.* An NTP client that reads the current time from the internet.* Code for reading the temperature from a Bosch BME280 weather sensor.
+* A web server serving up a page that allows me to move the door up and down.
+* An NTP client that reads the current time from the internet.
+* Code for reading the temperature from a Bosch BME280 weather sensor.
 
 # The hardware
 
-In this project, I used a DC motor to move the door up and down. I used a DC motor because I found one with a really high torque, which fits my use case very well. The second important element is a microcontroller to control the system. I selected an ESP8285 for this task and it works very well. It is also extremely cheap, just a few euros on the well known Chinese websites. I used the Arduino development environment to write the software. It's not the best IDE, but it's free and does the job.
+For my first experiments, I used a DC motor I took from an old printer and a small motor driver. I stuck all the parts I thought I would need on a breadboard and started making the software. Here a photo of this experimental setup:
+
+![Experimenting](https://github.com/Tsjakka/ChickenCoop/blob/master/Photos/IMG_20200118_175027487.jpg)
+
+This worked very well for creating and testing the software. But this motor is absolutely too weak for lifting the actual door of the chicken coop, which is a triplex board of 300 x 200 x 4 mm. For this I found a motor with a built-in transmission and a really high torque that can be run on 12V.
+The second important element is a microcontroller to control the system. I selected an ESP8285 for this task and it works very well. It is also extremely cheap, just a few euros on the well known Chinese websites. I used the Arduino development environment to write the software. It's not the best IDE, but it's free and does the job.
 
 The full list of hardware is:
-* Aslong JGB37-3530 12V DC motor with built-in transmission - 20RPML298N Bipolar stepper motor and DC-motor driver
+* Aslong JGB37-3530 12V DC motor with built-in transmission - 20RPM
+* L298N Bipolar stepper motor and DC-motor driver
 * ESP8285 Development Board12 pin header (2x) for ESP8285
 * Bosch BME280 weather sensor (optional)
 * 4 pin header for BME280 (optional)
@@ -35,6 +43,7 @@ The full list of hardware is:
 * A piece of threaded rod, 8mm
 * Part of a broomstick
 * USB Power supply
+* Power supply for the motor (12V)
 * Micro USB cable - 1.8m
 * Various pieces of wire
 
