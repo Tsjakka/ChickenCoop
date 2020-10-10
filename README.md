@@ -32,17 +32,18 @@ The second important element is a microcontroller to control the system. I selec
 The full list of hardware is:
 * Aslong JGB37-3530 12V DC motor with built-in transmission - 20RPM
 * L298N Bipolar stepper motor and DC-motor driver
-* ESP8285 Development Board12 pin header (2x) for ESP8285
+* ESP8285 Development Board
+* 12-pin header for ESP8285 (2x)
 * Bosch BME280 weather sensor (optional)
-* 4 pin header for BME280 (optional)
-* TCRT5000 Tracking Sensor Module 2x (optional)
-* 3 Pin Screw Terminal Block Connector 2.54mm for TCRT5000 4x (optional)
+* 4-pin header for BME280 (optional)
+* TCRT5000 Tracking Sensor Module (2x) (optional)
+* 3-pin Screw Terminal Block Connector 2.54mm for TCRT5000 (4x) (optional)
 * Kradex Enclosure 176x126x57mm - Grey - Z74J
 * Universal Single Side PCB Board Glass Fiber 5cm*7cm
 * Motor coupling - 5mm to 8mm
 * A piece of threaded rod, 8mm
 * Part of a broomstick
-* USB Power supply
+* USB Power supply (5V)
 * Power supply for the motor (12V)
 * Micro USB cable - 1.8m
 * Various pieces of wire
