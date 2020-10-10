@@ -26,6 +26,10 @@
 #include <Adafruit_BME280.h>
 #include <ESPMail.h>
 
+// ************************************************************************
+// Change the constants below to adjust the software to your situation
+// ************************************************************************
+
 const float Latitude = 0.0000000;           // Replace with your coordinates
 const float Longitude = 0.000000;
 const int Timezone = 120;                   // UTC difference in minutes (including DST)
@@ -40,13 +44,6 @@ const bool UseLowerSensor = false;          // Use a sensor to detect when the d
 const float ClosingTemperature = 0;         // Close the door at night when the temperature goes below this value
 const time_t LoopPeriod = 180;              // Number of seconds between checks
 
-Adafruit_BME280 bme;                        // The class that controls the BME280 sensor
-bool Bme280Present = true;                  // Initialize/use the BME280 or not
-volatile time_t previousCheckAt = 0;
-float temperature;
-float humidity;                             // Informational
-float pressure;                             // Informational
-
 // Open and closing times
 const uint8_t MinutesBeforeRiseClose = 75;  // The number of minutes before sunset we close the coop
 const uint8_t HourOpen = 6;                 // The time the chickens may leave the coop
@@ -60,12 +57,6 @@ const char* ssid = "REPLACE_WITH_YOUR_SSID";
 const char* password = "REPLACE_WITH_YOUR_PASSWORD";
 const time_t connectPeriod = 60;            // Max period (in s) for setting up a wifi connection
 
-// Set web server port number to 80
-WiFiServer server(80);
-WiFiClient client;
-bool clientActive = false;
-String currentLine = "";                    // A string to hold incoming data from the client
-
 // Variable to store the HTTP request
 String header;
 
@@ -73,7 +64,7 @@ String header;
 const unsigned int localPort = 2390;        // Local port to listen for UDP packets
 IPAddress timeServer(129, 6, 15, 28);       // time.nist.gov NTP server
 const int NtpPacketSize = 48;               // NTP time stamp is in the first 48 bytes of the message
-const time_t UpdateTimeTimeout = 120;       // Time (in seconds) we will try updating the clock
+const time_t UpdateTimeTimeout = 180;       // Time (in seconds) we will try updating the clock
 
 byte packetBuffer[NtpPacketSize];           // Buffer to hold incoming and outgoing packets
 time_t updateTimeStarted;                   // The time when we started updating the clock
@@ -82,23 +73,24 @@ bool emailSent = false;                     // Has an email been sent because se
 int lastSecond = -1;                        // The second we last did stuff for NTP
 bool settingSunRiseSunSet = false;          // True when setting the sunrise and sunset
 
+// Email
 char* address = "REPLACE_WITH_YOUR_EMAIL";  // The email address you want alarm messages sent to
 char* apikey = "REPLACE_WITH_YOUR_API_KEY"; // The very long API key that you get when making an account with sendgrid
-
-// A UDP instance to let us send and receive packets over UDP
-WiFiUDP Udp;
+char* smtpServer = "REPLACE_WITH_YOUR_SERVER";     // The server to use for sending email
+char* emailAccount = "REPLACE_WITH_YOUR_ACCOUNT";              // The email account on the server
+char* emailPassword = "REPLACE_WITH_YOUR_PASSWORD"; // The password for the email account
 
 // Wired connections
-#define L9110_A_IA 0                        // D4 --> Motor A Input A --> MOTOR A +
-#define L9110_A_IB 2                        // D4 --> Motor A Input B --> MOTOR A -
-#define UPPER_SENSOR_PIN 13                 // Digital output of upper TCRT5000 Tracking Sensor Module
-#define LOWER_SENSOR_PIN 16                 // Digital output of lower TCRT5000 Tracking Sensor Module
-#define BUZZER_PIN 12
+const int L9110_A_IA = 0;                   // D4 --> Motor A Input A --> MOTOR A +
+const int L9110_A_IB = 2;                   // D4 --> Motor A Input B --> MOTOR A -
+const int UpperSensorPin = 13;              // Digital output of upper TCRT5000 Tracking Sensor Module
+const int LowerSensorPin = 16;              // Digital output of lower TCRT5000 Tracking Sensor Module
+const int BuzzerPin = 12;
 
 // The actual values for "fast" and "slow" depend on the motor
-#define PWM_SLOW 750                        // Arbitrary slow speed PWM duty cycle
-#define PWM_FAST 1023                       // Arbitrary fast speed PWM duty cycle
-#define DIR_DELAY 1000                      // Brief delay for abrupt motor changes
+const int PwmSlow = 750;                    // Arbitrary slow speed PWM duty cycle
+const int PwmFast = 1023;                   // Arbitrary fast speed PWM duty cycle
+const int DirDelay = 1000;                  // Brief delay for abrupt motor changes
 
 // Stuff related to controlling the motor
 const time_t DefMoveUpMillis = 12750;       // The default duration of an up move.
@@ -106,6 +98,12 @@ const time_t DefMoveDownMillis = 12500;     // The default duration of a down mo
 const time_t MaxMoveMillis = 14000;         // If moving the door takes longer than this perform a try.
 const time_t ClearSensorMillis = 140;       // The duration of a move used for clearing a sensor.
 const int MaxAttempts = 1;                  // Number of times the move should be retried
+
+bool Bme280Present = true;                  // Initialize/use the BME280 or not
+
+// ************************************************************************
+// Change the constants above to adjust the software to your situation
+// ************************************************************************
 
 enum Direction {
   DownDir,
@@ -127,13 +125,6 @@ enum Command {
   NoCmd
 };
 
-Command webCommand = NoCmd;
-
-// For sunrise and sunset
-sunMoon sm;
-time_t sunRise = 0;
-time_t sunSet = 0;
-
 // Stuff related to the state machine controlling the door
 enum StateMachineState
 {
@@ -150,6 +141,22 @@ enum StateMachineState
   Alarm = 10
 };
 
+// Set web server port number to 80
+WiFiServer server(80);
+WiFiClient client;
+bool clientActive = false;
+String currentLine = "";                    // A string to hold incoming data from the client
+
+// A UDP instance to let us send and receive packets over UDP
+WiFiUDP Udp;
+
+Command webCommand = NoCmd;
+
+// For sunrise and sunset
+sunMoon sm;
+time_t sunRise = 0;
+time_t sunSet = 0;
+
 enum StateMachineState stateMachineState = NotRunning;
 enum StateMachineState previousStateMachineState = NotRunning;
 enum StateMachineState prevState = NotRunning;                  // Used for returning to the previous state when moving 1 second
@@ -162,6 +169,13 @@ bool upperSensorCleared = false;
 bool previousLowerSensorDetected = false;
 bool previousUpperSensorDetected = false;
 unsigned long startMovingMillis = 0;
+
+// The class that controls the BME280 sensor
+Adafruit_BME280 bme;
+volatile time_t previousCheckAt = 0;
+float temperature;
+float humidity;                             // Informational
+float pressure;                             // Informational
 
 // The setup function that initializes everything
 void setup() {
@@ -222,11 +236,11 @@ void setup() {
   digitalWrite(L9110_A_IA, LOW);
 
   // Sensors
-  pinMode(UPPER_SENSOR_PIN, INPUT);
-  pinMode(LOWER_SENSOR_PIN, INPUT);
+  pinMode(UpperSensorPin, INPUT);
+  pinMode(LowerSensorPin, INPUT);
 
   // Buzzer
-  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BuzzerPin, OUTPUT);
 
   // When using the temperature, initialize the BME280
   if (Bme280Present) {
@@ -382,24 +396,24 @@ void moveDoor(Speed speed, Direction direction) {
   // Always stop motor before running it to avoid abrupt changes
   digitalWrite(L9110_A_IB, LOW);
   digitalWrite(L9110_A_IA, LOW);
-  delay(DIR_DELAY);
+  delay(DirDelay);
 
   // Write new motor direction and speed
   if (speed == Fast && direction == DownDir) {
     Serial.println("Moving down fast...");
-    analogWrite(L9110_A_IA, PWM_FAST); // PWM speed = fast
+    analogWrite(L9110_A_IA, PwmFast); // PWM speed = fast
   }
   else if (speed == Slow && direction == DownDir) {
     Serial.println("Moving down slowly...");
-    analogWrite(L9110_A_IA, PWM_SLOW); // PWM speed = slow
+    analogWrite(L9110_A_IA, PwmSlow); // PWM speed = slow
   }
   else if (speed == Fast && direction == UpDir) {
     Serial.println("Moving up fast...");
-    analogWrite(L9110_A_IB, PWM_FAST); // PWM speed = fast
+    analogWrite(L9110_A_IB, PwmFast); // PWM speed = fast
   }
   else if (speed == Slow && direction == UpDir) {
     Serial.println("Moving up slowly...");
-    analogWrite(L9110_A_IB, PWM_SLOW); // PWM speed = slow
+    analogWrite(L9110_A_IB, PwmSlow); // PWM speed = slow
   }
   else if (speed == Stop) {
     Serial.println("Stop...");
@@ -591,11 +605,11 @@ void handleWebClient() {
 }
 
 void startBuzzer() {
-  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(BuzzerPin, HIGH);
 }
 
 void stopBuzzer() {
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BuzzerPin, LOW);
 }
 
 // Calculate the next sunrise and sunset and time for closing the door
@@ -635,8 +649,8 @@ void setSunriseSunsetClosingTime() {
 }
 
 bool detectSensors() {
-  upperSensorDetected = !digitalRead(UPPER_SENSOR_PIN);
-  lowerSensorDetected = !digitalRead(LOWER_SENSOR_PIN);
+  upperSensorDetected = !digitalRead(UpperSensorPin);
+  lowerSensorDetected = !digitalRead(LowerSensorPin);
 
   if (upperSensorDetected != previousUpperSensorDetected) {
     Serial.print("Upper sensor ");
@@ -665,8 +679,8 @@ bool detectSensors() {
 void sendEmail(int message) {
   ESPMail mail;
   mail.begin();
-  mail.setSubject(address, "Problem with chicken door");
-  mail.addTo(address);
+  mail.setSubject(fromAddress, "Problem with chicken door");
+  mail.addTo(toAddress);
   //mail.addCC("name@email.com");
   if (message == 1) {
     mail.setBody("The clock could not be set.");
@@ -679,7 +693,7 @@ void sendEmail(int message) {
   }
   //mail.setHTMLBody("This is an example html <b>e-mail<b/>.\n<u>Regards</u>");
   
-  if (mail.send("smtp.sendgrid.net", 587, "apikey", "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") == 0) {
+  if (mail.send(smtpServer, 587, emailAccount, emailPassword) == 0) {
     Serial.println("Mail sent OK");
   }
   else {
@@ -690,7 +704,7 @@ void sendEmail(int message) {
 void loop() {
   // Set the time when not set
   if (!ntpTimeSet) {
-    // If not set, check for the time, but only for 10 minutes.
+    // If not set, check for the time, but only for a few minutes.
     // In order not to do these checks every loop, proceed only once a second
     if ((now() < updateTimeStarted + UpdateTimeTimeout) && (lastSecond != second())) {
       // Send a packet every 15 seconds and check for an answer the other times
@@ -721,6 +735,10 @@ void loop() {
         }
       }
       lastSecond = second();
+    }
+    else if (now() > updateTimeStarted + 3600) {
+      // After an hour, try it again.
+      updateTimeStarted = now();
     }
     else if (now() > updateTimeStarted + UpdateTimeTimeout) {
       // No time packet was received, send a warning email once.
