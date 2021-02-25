@@ -55,16 +55,16 @@ time_t closingTime = 0;                     // The time the door will close toda
 // For the Wifi connection. Replace with your network credentials
 const char* ssid = "REPLACE_WITH_YOUR_SSID";
 const char* password = "REPLACE_WITH_YOUR_PASSWORD";
-const time_t connectPeriod = 60;            // Max period (in s) for setting up a wifi connection
+const time_t connectPeriod = 90;            // Max period (in s) for setting up a wifi connection
 
 // Variable to store the HTTP request
 String header;
 
 // NTP stuff
+char* NtpServer = "time.windows.com";       // A reliable NTP server ("time.nist.gov" didn't work so well)
 const unsigned int localPort = 2390;        // Local port to listen for UDP packets
-IPAddress timeServer(129, 6, 15, 28);       // time.nist.gov NTP server
 const int NtpPacketSize = 48;               // NTP time stamp is in the first 48 bytes of the message
-const time_t UpdateTimeTimeout = 180;       // Time (in seconds) we will try updating the clock
+const time_t UpdateTimeTimeout = 300;       // Time (in seconds) we will try updating the clock
 
 byte packetBuffer[NtpPacketSize];           // Buffer to hold incoming and outgoing packets
 time_t updateTimeStarted;                   // The time when we started updating the clock
@@ -74,8 +74,8 @@ int lastSecond = -1;                        // The second we last did stuff for 
 bool settingSunRiseSunSet = false;          // True when setting the sunrise and sunset
 
 // Email
-char* address = "REPLACE_WITH_YOUR_EMAIL";  // The email address you want alarm messages sent to
-char* apikey = "REPLACE_WITH_YOUR_API_KEY"; // The very long API key that you get when making an account with sendgrid
+char* fromAddress = "REPLACE_WITH_YOUR_EMAIL";       // The address you want alarm messages sent from
+char* toAddress = "REPLACE_WITH_YOUR_EMAIL";    // The email address you want alarm messages sent to
 char* smtpServer = "REPLACE_WITH_YOUR_SERVER";     // The server to use for sending email
 char* emailAccount = "REPLACE_WITH_YOUR_ACCOUNT";              // The email account on the server
 char* emailPassword = "REPLACE_WITH_YOUR_PASSWORD"; // The password for the email account
@@ -144,7 +144,7 @@ enum StateMachineState
 // Set web server port number to 80
 WiFiServer server(80);
 WiFiClient client;
-bool clientActive = false;
+bool clientActive = false;                  // A web client is active
 String currentLine = "";                    // A string to hold incoming data from the client
 
 // A UDP instance to let us send and receive packets over UDP
@@ -269,8 +269,8 @@ void setup() {
 //  Serial.println(" seconds");
 
   // For NTP
-  Serial.println("Starting listening for UDP packets.");
   Udp.begin(localPort);
+  Serial.println("Started listening for UDP packets.");
   updateTimeStarted = now();
 
   // Start the webserver
@@ -278,28 +278,22 @@ void setup() {
 }
 
 // Send an NTP request to the time server at the given address
-void sendNtpPacket(IPAddress& address) {
+int sendNtpPacket(const char *host) {
+  int result = 0;
+  
   // Set all bytes in the buffer to 0
   memset(packetBuffer, 0, NtpPacketSize);
 
   // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
   packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
 
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12] = 49;
-  packetBuffer[13] = 0x4E;
-  packetBuffer[14] = 49;
-  packetBuffer[15] = 52;
-
-  // All NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  // All needed NTP fields have been given values, now
+  // send a packet requesting a timestamp
+  result = Udp.beginPacket(host, 123); // NTP requests are to port 123
   Udp.write(packetBuffer, NtpPacketSize);
   Udp.endPacket();
+
+  return result;
 }
 
 time_t getNtpTime() {
@@ -310,7 +304,7 @@ time_t getNtpTime() {
     Serial.println("Packet received");
 
     // We've received a packet, read the data from it
-    Udp.read(packetBuffer, NtpPacketSize); // read the packet into the buffer
+    Udp.read(packetBuffer, NtpPacketSize); // Read the packet into the buffer
 
     // The timestamp starts at byte 40 of the received packet and is four bytes,
     // or two words, long. First, esxtract the two words:
@@ -324,37 +318,15 @@ time_t getNtpTime() {
     Serial.print("Seconds since Jan 1 1900 = ");
     Serial.println(secsSince1900);
 
-    // Convert NTP time into everyday time:
-    //Serial.print("Unix time = ");
-
     // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
     const unsigned long seventyYears = 2208988800UL;
 
     // Subtract seventy years:
     unsigned long epoch = secsSince1900 - seventyYears;
 
-    // Print Unix time:
-    //Serial.println(epoch);
-
     Serial.print("UTC time is: ");
     printDateTime(epoch);
     Serial.println();
-
-    // Print the hour, minute and second:
-  //    Serial.print("The UTC time is ");       // UTC is the time at Greenwich Meridian (GMT)
-  //    Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
-  //    Serial.print(':');
-  //    if (((epoch % 3600) / 60) < 10) {
-  //      // In the first 10 minutes of each hour, we'll want a leading '0'
-  //      Serial.print('0');
-  //    }
-  //    Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
-  //    Serial.print(':');
-  //    if ((epoch % 60) < 10) {
-  //      // In the first 10 seconds of each minute, we'll want a leading '0'
-  //      Serial.print('0');
-  //    }
-  //    Serial.println(epoch % 60); // print the second
 
     result = epoch;
   }
@@ -600,6 +572,9 @@ void handleWebClient() {
           currentLine += c;    // add it to the end of the currentLine
         }
       }
+    } else {
+      clientActive = false;
+      Serial.println("Client no longer connected");
     }
   }
 }
@@ -707,14 +682,17 @@ void loop() {
     // If not set, check for the time, but only for a few minutes.
     // In order not to do these checks every loop, proceed only once a second
     if ((now() < updateTimeStarted + UpdateTimeTimeout) && (lastSecond != second())) {
-      // Send a packet every 15 seconds and check for an answer the other times
-      if (second() % 15 == 0) {
+      // Send a packet every 30 seconds and check for an answer the other times
+      if (second() % 30 == 8) {
         Serial.print("Requesting time from NTP server at ");
         printDateTime(now());
         Serial.println();
 
         // Send an NTP packet to a time server
-        sendNtpPacket(timeServer);
+        if (sendNtpPacket(NtpServer) == 0) {
+          Serial.print(F("DNS lookup failed for "));
+          Serial.println(NtpServer);
+        }
       }
       else {
         // Check for received packets
@@ -1109,5 +1087,9 @@ void loop() {
   stateChanged = (stateMachineState != previousStateMachineState);
   previousStateMachineState = stateMachineState;
 
-  delay(5);
+  if (clientActive) {
+    delay(1);
+  } else {
+    delay(10);
+  }
 }
