@@ -3,8 +3,7 @@
   based on the time of day or on the outside temperature, sunrise and sunset.
   A DC motor is used to move the door up and down.
   Optionally, optical reflection sensors are used to control the up and down
-  movement of the door. Also optionally, a buzzer is used to warn the chickens
-  that the door will be closing.
+  movement of the door.
   Various information, such as the status of the door, is presented on a web
   page. The position of the door can be calibrated using the web page.
 
@@ -12,6 +11,7 @@
   https://randomnerdtutorials.com/esp8266-web-server/
   https://www.bananarobotics.com/shop/How-to-use-the-HG7881-(L9110)-Dual-Channel-Motor-Driver-Module
   https://www.arduino.cc/en/Tutorial/UdpNTPClient
+  https://github.com/sfrwmaker/sunMoon
 
   Written by Tsjakka from the Netherlands.
   BSD license, all text above must be included in any redistribution.
@@ -25,6 +25,7 @@
 #include <WiFiUdp.h>
 #include <Adafruit_BME280.h>
 #include <ESPMail.h>
+#include <ESP_EEPROM.h>
 
 // ************************************************************************
 // Change the constants below to adjust the software to your situation
@@ -32,25 +33,25 @@
 
 const float Latitude = 0.0000000;           // Replace with your coordinates
 const float Longitude = 0.000000;
-const int Timezone = 120;                   // UTC difference in minutes (including DST)
+int Timezone = 120;                         // UTC difference in minutes (including DST)
 
 // At least one of the following booleans must be true.
 const bool UseTemperature = false;          // Use the temperature for deciding when to open and close the door (otherwise it's time based)
 const bool UseClock = true;                 // Use the clock for deciding when to open and close the door (otherwise it's temperature based)
-const bool UseUpperSensor = false;          // Use a sensor to detect when the door is open
-const bool UseLowerSensor = false;          // Use a sensor to detect when the door is closed
 
 // For reading the temperature.
 const float ClosingTemperature = 0;         // Close the door at night when the temperature goes below this value
 const time_t LoopPeriod = 180;              // Number of seconds between checks
 
 // Open and closing times
-const uint8_t MinutesBeforeRiseClose = 75;  // The number of minutes before sunset we close the coop
-const uint8_t HourOpen = 6;                 // The time the chickens may leave the coop
-const uint8_t MinuteOpen = 59;
-const uint8_t WeekendHourOpen = 7;          // The time the chickens may leave the coop in the weekend
-const uint8_t WeekendMinuteOpen = 15;
+uint8_t CloseBeforeSunriseMinutes = 120;    // The number of minutes before sunrise we close the coop
+uint8_t HourOpen = 7;                       // The time the chickens may leave the coop
+uint8_t MinuteOpen = 20;
+uint8_t WeekendHourOpen = 7;                // The time the chickens may leave the coop in the weekend
+uint8_t WeekendMinuteOpen = 20;
 time_t closingTime = 0;                     // The time the door will close today
+uint8_t HourCalibration = 1;                // Hour when to calibrate the position of the door
+uint8_t MinuteCalibration = 0;              // Minute when to calibrate the position of the door
 
 // For the Wifi connection. Replace with your network credentials
 const char* ssid = "REPLACE_WITH_YOUR_SSID";
@@ -81,23 +82,20 @@ char* emailAccount = "REPLACE_WITH_YOUR_ACCOUNT";              // The email acco
 char* emailPassword = "REPLACE_WITH_YOUR_PASSWORD"; // The password for the email account
 
 // Wired connections
-const int L9110_A_IA = 0;                   // D4 --> Motor A Input A --> MOTOR A +
-const int L9110_A_IB = 2;                   // D4 --> Motor A Input B --> MOTOR A -
+const int L9110_A_IA = 12;                  // Motor A Input A --> MOTOR A +
+const int L9110_A_IB = 14;                  // Motor A Input B --> MOTOR A -
 const int UpperSensorPin = 13;              // Digital output of upper TCRT5000 Tracking Sensor Module
 const int LowerSensorPin = 16;              // Digital output of lower TCRT5000 Tracking Sensor Module
-const int BuzzerPin = 12;
 
 // The actual values for "fast" and "slow" depend on the motor
-const int PwmSlow = 750;                    // Arbitrary slow speed PWM duty cycle
-const int PwmFast = 1023;                   // Arbitrary fast speed PWM duty cycle
-const int DirDelay = 1000;                  // Brief delay for abrupt motor changes
+const int PwmSlow = 750;                    // Slow speed PWM duty cycle
+const int PwmFast = 1023;                   // Fast speed PWM duty cycle
+const int DirDelay = 1000;                  // Delay to prevent abrupt motor changes
 
 // Stuff related to controlling the motor
-const time_t DefMoveUpMillis = 12750;       // The default duration of an up move.
-const time_t DefMoveDownMillis = 12500;     // The default duration of a down move.
-const time_t MaxMoveMillis = 14000;         // If moving the door takes longer than this perform a try.
-const time_t ClearSensorMillis = 140;       // The duration of a move used for clearing a sensor.
-const int MaxAttempts = 1;                  // Number of times the move should be retried
+long UpMoveMillis = 12900;                  // The default duration of an up move.
+long DownMoveMillis = 12700;                // The default duration of a down move. When using a lower sensor this is used when the sensor fails
+long CalibrationMoveMillis = 2500;          // The max. duration of the move used for calibrating the position of the door
 
 bool Bme280Present = true;                  // Initialize/use the BME280 or not
 
@@ -131,14 +129,12 @@ enum StateMachineState
   NotRunning = 0,
   Initial = 1,
   Up = 2,
-  ClearingSensor = 3,
-  MovingDown = 4,
-  Down = 5,
-  MovingUp = 6,
-  MovingDownFailed = 7,
-  MovingUpFailed = 8,
-  Moving1Sec = 9,
-  Alarm = 10
+  MovingIntoSensor = 3,
+  ClearingSensor = 4,
+  MovingDown = 5,
+  Down = 6,
+  MovingUp = 7,
+  Moving1Sec = 8
 };
 
 // Set web server port number to 80
@@ -146,6 +142,8 @@ WiFiServer server(80);
 WiFiClient client;
 bool clientActive = false;                  // A web client is active
 String currentLine = "";                    // A string to hold incoming data from the client
+time_t clientConnectedAt;
+const time_t webConnectPeriod = 30;         // Max timeout period (in s) for HTTP connections
 
 // A UDP instance to let us send and receive packets over UDP
 WiFiUDP Udp;
@@ -161,11 +159,14 @@ enum StateMachineState stateMachineState = NotRunning;
 enum StateMachineState previousStateMachineState = NotRunning;
 enum StateMachineState prevState = NotRunning;                  // Used for returning to the previous state when moving 1 second
 bool stateChanged = true;  // Start with entry code
-int attempt = 0;
+
+bool CalibrateUsingSensor = true;           // Calibrate the door position using a sensor at the top position of the door
+bool UseLowerSensor = false;                // Use a sensor to detect when the door is closed
 
 bool lowerSensorDetected = false;
 bool upperSensorDetected = false;
-bool upperSensorCleared = false;
+bool doorCalibrated = false;
+bool calibrationFailed = false;
 bool previousLowerSensorDetected = false;
 bool previousUpperSensorDetected = false;
 unsigned long startMovingMillis = 0;
@@ -191,7 +192,7 @@ void setup() {
   Serial.print("Wi-Fi status = ");
   Serial.println(WiFi.getMode());
   // End initialization
-    
+
   // Connect to Wi-Fi network with SSID and password. Reboot if it continuously fails.
   Serial.print("Connecting to ");
   Serial.println(ssid);
@@ -204,17 +205,17 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  
+
   if (WiFi.waitForConnectResult() == WL_CONNECTED) {
     // Print local IP address and start web server
     Serial.println("Wi-Fi connected.");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-  
+
     // Print the SSID of the network you're attached to
     Serial.print("SSID: ");
     Serial.println(WiFi.SSID());
-  
+
     // Print the received signal strength
     long rssi = WiFi.RSSI();
     Serial.print("Signal strength (RSSI): ");
@@ -239,9 +240,6 @@ void setup() {
   pinMode(UpperSensorPin, INPUT);
   pinMode(LowerSensorPin, INPUT);
 
-  // Buzzer
-  pinMode(BuzzerPin, OUTPUT);
-
   // When using the temperature, initialize the BME280
   if (Bme280Present) {
     // Check for the BME280 sensor
@@ -251,22 +249,36 @@ void setup() {
       Serial.println("Setting BME280 to weather station scenario:");
       Serial.println("  Forced mode, 1x temperature / 1x humidity / 1x pressure oversampling, filter off");
       bme.setSampling(Adafruit_BME280::MODE_FORCED,
-                      Adafruit_BME280::SAMPLING_X1, // Temperature
-                      Adafruit_BME280::SAMPLING_X1, // Pressure
-                      Adafruit_BME280::SAMPLING_X1, // Humidity
-                      Adafruit_BME280::FILTER_OFF);
+        Adafruit_BME280::SAMPLING_X1, // Temperature
+        Adafruit_BME280::SAMPLING_X1, // Pressure
+        Adafruit_BME280::SAMPLING_X1, // Humidity
+        Adafruit_BME280::FILTER_OFF);
     }
-    else {                   
-        Serial.println(F("Could not find a valid BME280 sensor, please check wiring."));
-        Bme280Present = false;
+    else {
+      Serial.println(F("Could not find a valid BME280 sensor, please check wiring."));
+      Bme280Present = false;
     }
   }
 
-//  time_t now;
-//  time(&now);
-//  Serial.print("Starting up at ");
-//  Serial.print(now);
-//  Serial.println(" seconds");
+  // The begin() call is required to initialize the EEPROM library
+  EEPROM.begin(32);
+
+  // Read from EEPROM
+  bool dataPresent = false;
+  EEPROM.get(0, dataPresent);
+  if (dataPresent) {
+    EEPROM.get(1, Timezone);
+    EEPROM.get(5, CloseBeforeSunriseMinutes);
+    EEPROM.get(6, HourOpen);
+    EEPROM.get(7, MinuteOpen);
+    EEPROM.get(8, WeekendHourOpen);
+    EEPROM.get(9, WeekendMinuteOpen);
+    EEPROM.get(10, CalibrateUsingSensor);
+    EEPROM.get(11, UseLowerSensor);
+    EEPROM.get(12, UpMoveMillis);
+    EEPROM.get(16, DownMoveMillis);
+    EEPROM.get(20, CalibrationMoveMillis);
+  }
 
   // For NTP
   Udp.begin(localPort);
@@ -278,9 +290,9 @@ void setup() {
 }
 
 // Send an NTP request to the time server at the given address
-int sendNtpPacket(const char *host) {
+int sendNtpPacket(const char* host) {
   int result = 0;
-  
+
   // Set all bytes in the buffer to 0
   memset(packetBuffer, 0, NtpPacketSize);
 
@@ -398,8 +410,11 @@ void handleWebClient() {
 
   if (!clientActive) {
     client = server.available();            // Listen for incoming clients
-    if (client) {                           // If a new client connects,
-      Serial.println("New Client");         // print a message out in the serial port
+    if (client) {                           // If a new client connects
+      clientConnectedAt = now();
+      Serial.print("New client connection at ");
+      printDateTime(clientConnectedAt);
+      Serial.println();
       clientActive = true;
       currentLine = "";
     }
@@ -442,11 +457,135 @@ void handleWebClient() {
               Serial.println("Stop selected");
               webCommand = StopCmd;
             }
+            else if (header.indexOf("GET /params") >= 0) {
+              // Find first parameter
+              int begin = header.indexOf('?');
+              int end = header.indexOf('&');
+              Serial.print("begin=");
+              Serial.print(begin);
+              Serial.print(" end=");
+              Serial.println(end);
+              if (begin > -1 && end > begin + 1) {
+                String sub = header.substring(begin + 1, end);
+                Serial.print("Substring: ");
+                Serial.println(sub);
+
+                // Split parameter in name and value. Repeat for all parameters
+                bool dataPresent = true;
+                bool invalidParam = false;
+                do {
+                  int equalsPos = sub.indexOf('=');
+                  if (equalsPos > -1) {
+                    String param = sub.substring(0, equalsPos);
+                    String value = sub.substring(equalsPos + 1, sub.length());
+                    Serial.print("Parsed ");
+                    Serial.print(param);
+                    Serial.print(" = ");
+                    Serial.println(value);
+
+                    // Check for and set the variables
+                    long temp;
+                    if (param.indexOf("Revert") == 0) {
+                      temp = value.toInt();
+                      if (temp == 0) dataPresent = false;
+                    }
+                    else if (param.indexOf("Timezone") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) Timezone = temp;
+                    }
+                    else if (param.indexOf("CloseBeforeSunriseMinutes") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) CloseBeforeSunriseMinutes = temp;
+                    }
+                    else if (param.indexOf("HourOpen") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) HourOpen = temp;
+                    }
+                    else if (param.indexOf("MinuteOpen") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) MinuteOpen = temp;
+                    }
+                    else if (param.indexOf("WeekendHourOpen") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) WeekendHourOpen = temp;
+                    }
+                    else if (param.indexOf("WeekendMinuteOpen") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) WeekendMinuteOpen = temp;
+                    }
+                    else if (param.indexOf("CalibrateUsingSensor") == 0) {
+                      temp = value.toInt();
+                      CalibrateUsingSensor = (temp == 1);
+                    }
+                    else if (param.indexOf("UseLowerSensor") == 0) {
+                      temp = value.toInt();
+                      UseLowerSensor = (temp == 1);
+                    }
+                    else if (param.indexOf("UpMoveMillis") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) UpMoveMillis = temp;
+                    }
+                    else if (param.indexOf("DownMoveMillis") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) DownMoveMillis = temp;
+                    }
+                    else if (param.indexOf("CalibrationMoveMillis") == 0) {
+                      temp = value.toInt();
+                      if (temp >= 0) CalibrationMoveMillis = temp;
+                    }
+                    else {
+                      invalidParam = true;
+                    }
+                  }
+                  else {
+                    invalidParam = true;
+                  }
+
+                  // Go to next parameter
+                  begin = end + 1;
+                  end = header.indexOf('&', begin);
+                  if (end < 0 || end > header.indexOf(' ', begin)) {
+                    end = header.indexOf(' ', begin);
+                    if (end < 0) {
+                      end = header.length();
+                    }
+                  }
+                  Serial.print("begin=");
+                  Serial.print(begin);
+                  Serial.print(" end=");
+                  Serial.println(end);
+
+                  if (end > begin + 1) {
+                    sub = header.substring(begin, end);
+                    Serial.print("Substring: ");
+                    Serial.println(sub);
+                  }
+                } while (!invalidParam && end > begin + 1);
+
+                // Put new settings into EEPROM
+                EEPROM.put(0, dataPresent);
+                EEPROM.put(1, Timezone);
+                EEPROM.put(5, CloseBeforeSunriseMinutes);
+                EEPROM.put(6, HourOpen);
+                EEPROM.put(7, MinuteOpen);
+                EEPROM.put(8, WeekendHourOpen);
+                EEPROM.put(9, WeekendMinuteOpen);
+                EEPROM.put(10, CalibrateUsingSensor);
+                EEPROM.put(11, UseLowerSensor);
+                EEPROM.put(12, UpMoveMillis);
+                EEPROM.put(16, DownMoveMillis);
+                EEPROM.put(20, CalibrationMoveMillis);
+  
+                // Write the data to EEPROM
+                bool ok = EEPROM.commit();
+                Serial.println((ok) ? "Commit OK" : "Commit failed");
+              }
+            }
 
             time_t t_now = now();
             printDateTime(t_now);
             Serial.println();
-            
+
             // Display the HTML web page
             client.println("<!DOCTYPE html><html>");
             client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
@@ -506,49 +645,59 @@ void handleWebClient() {
             // 
             client.print("<p>State: ");
             switch (stateMachineState) {
-              case NotRunning:
-                client.print("NotRunning</p>");
-                break;
-              case Initial:
-                client.print("Initial</p>");
-                break;
-              case Up:
-                client.print("Up</p>");
-                client.println("<p><a href=\"/down\"><button class=\"button\">Down</button></a></p>");
-                client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
-                client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
-                break;
-              case MovingDown:
-                client.print("MovingDown</p>");
-                client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
-                break;
-              case Down:
-                client.print("Down</p>");
-                client.println("<p><a href=\"/up\"><button class=\"button\">Up</button></a></p>");
-                client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
-                client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
-                break;
-              case MovingUp:
-                client.print("MovingUp</p>");
-                client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
-                break;
-              case MovingDownFailed:
-                client.print("MovingDownFailed</p>");
-                break;
-              case MovingUpFailed:
-                client.print("MovingUpFailed</p>");
-                break;
-              case Moving1Sec:
-                client.print("Moving1Sec</p>");
-                break;
-              case Alarm:
-                client.print("Alarm</p>");
-                break;
-              default:
-                client.print("Unknown</p>");
-                break;
+            case NotRunning:
+              client.print("NotRunning</p>");
+              break;
+            case Initial:
+              client.print("Initial</p>");
+              break;
+            case Up:
+              client.print("Up</p>");
+              client.println("<p><a href=\"/down\"><button class=\"button\">Down</button></a></p>");
+              client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
+              client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
+              break;
+            case MovingDown:
+              client.print("MovingDown</p>");
+              client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
+              break;
+            case Down:
+              client.print("Down</p>");
+              client.println("<p><a href=\"/up\"><button class=\"button\">Up</button></a></p>");
+              client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
+              client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
+              break;
+            case MovingUp:
+              client.print("MovingUp</p>");
+              client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
+              break;
+            case Moving1Sec:
+              client.print("Moving1Sec</p>");
+              break;
+            default:
+              client.print("Unknown</p>");
+              break;
             }
-            client.println("<p><a href=\"/\"><button class=\"button\">Refresh</button></a></p>");
+            client.println("<p><a href=\"/\"><button class=\"button\">Refresh</button></a></p><br>");
+
+            // Print the form for uploading settings
+            int revert = 1;
+            client.println("<form action=\"/params\">");
+            client.println("Enter 0 to revert to default values after reset:<input type=\"text\" name=\"Revert\" value=\""); client.print(revert); client.print("\"><br>");
+            client.println("Timezone:<input type=\"text\" name=\"Timezone\" value=\""); client.print(Timezone); client.print("\"><br>");
+            client.println("CloseBeforeSunriseMinutes:<input type=\"text\" name=\"CloseBeforeSunriseMinutes\" value=\""); client.print(CloseBeforeSunriseMinutes); client.print("\"><br>");
+            client.println("HourOpen:<input type=\"text\" name=\"HourOpen\" value=\""); client.print(HourOpen); client.print("\"><br>");
+            client.println("MinuteOpen:<input type=\"text\" name=\"MinuteOpen\" value=\""); client.print(MinuteOpen); client.print("\"><br>");
+            client.println("WeekendHourOpen:<input type=\"text\" name=\"WeekendHourOpen\" value=\""); client.print(WeekendHourOpen); client.print("\"><br>");
+            client.println("WeekendMinuteOpen:<input type=\"text\" name=\"WeekendMinuteOpen\" value=\""); client.print(WeekendMinuteOpen); client.print("\"><br>");
+            client.println("CalibrateUsingSensor:<input type=\"text\" name=\"CalibrateUsingSensor\" value=\""); client.print(CalibrateUsingSensor); client.print("\"><br>");
+            client.println("UseLowerSensor:<input type=\"text\" name=\"UseLowerSensor\" value=\""); client.print(UseLowerSensor); client.print("\"><br>");
+            client.println("UpMoveMillis:<input type=\"text\" name=\"UpMoveMillis\" value=\""); client.print(UpMoveMillis); client.print("\"><br>");
+            client.println("DownMoveMillis:<input type=\"text\" name=\"DownMoveMillis\" value=\""); client.print(DownMoveMillis); client.print("\"><br>");
+            client.println("CalibrationMoveMillis:<input type=\"text\" name=\"CalibrationMoveMillis\" value=\""); client.print(CalibrationMoveMillis); client.print("\"><br>");
+            client.println("<input type=\"submit\" value=\"Submit\">");
+            client.println("</form>");
+
             client.println("</body></html>");
 
             // The HTTP response ends with another blank line
@@ -556,12 +705,12 @@ void handleWebClient() {
 
             // Clear the header variable
             header = "";
-        
+
             // Close the connection
             client.stop();
             Serial.println("Client disconnected");
             Serial.println("");
-      
+
             clientActive = false;
           }
           else { // If you got a newline, then clear currentLine
@@ -572,19 +721,19 @@ void handleWebClient() {
           currentLine += c;    // add it to the end of the currentLine
         }
       }
-    } else {
+      else {
+        // The client is connected but no data is available. Time out if this takes too long.
+        if (now() > clientConnectedAt + webConnectPeriod) {
+          clientActive = false;
+          Serial.println("Client connection timed out");
+        }
+      }
+    }
+    else {
       clientActive = false;
       Serial.println("Client no longer connected");
     }
   }
-}
-
-void startBuzzer() {
-  digitalWrite(BuzzerPin, HIGH);
-}
-
-void stopBuzzer() {
-  digitalWrite(BuzzerPin, LOW);
 }
 
 // Calculate the next sunrise and sunset and time for closing the door
@@ -599,25 +748,25 @@ void setSunriseSunsetClosingTime() {
   printDateTime(sunSet);
   Serial.println();
 
-  // The time for closing the door is <MinutesBeforeRiseClose> before sunset 
+  // The time for closing the door is <CloseBeforeSunriseMinutes> before sunset 
   // or opening time, whichever comes first.
   tmElements_t openingTimeElements;
   if (dayOfWeek(now()) > 1 && dayOfWeek(now()) < 7) {
-    openingTimeElements = {second(), MinuteOpen, HourOpen, weekday(), day(), month(), year() - 1970 };
+    openingTimeElements = { second(), MinuteOpen, HourOpen, weekday(), day(), month(), year() - 1970 };
   }
   else {
-    openingTimeElements = {second(), WeekendMinuteOpen, WeekendHourOpen, weekday(), day(), month(), year() - 1970 };
+    openingTimeElements = { second(), WeekendMinuteOpen, WeekendHourOpen, weekday(), day(), month(), year() - 1970 };
   }
   time_t openingTime = makeTime(openingTimeElements);
 
   if (openingTime < sunRise) {
     Serial.println("The time for opening is before sunset.");
-    closingTime = openingTime - (MinutesBeforeRiseClose * 60);
+    closingTime = openingTime - (CloseBeforeSunriseMinutes * 60);
   }
   else {
-    closingTime = sunRise - (MinutesBeforeRiseClose * 60);
+    closingTime = sunRise - (CloseBeforeSunriseMinutes * 60);
   }
-  
+
   Serial.print("Closing the door today at: ");
   printDateTime(closingTime);
   Serial.println();
@@ -631,7 +780,7 @@ bool detectSensors() {
     Serial.print("Upper sensor ");
     if (upperSensorDetected) {
       Serial.println("triggered");
-    } 
+    }
     else {
       Serial.println("released");
     }
@@ -641,7 +790,7 @@ bool detectSensors() {
     Serial.print("Lower sensor ");
     if (lowerSensorDetected) {
       Serial.println("triggered");
-    } 
+    }
     else {
       Serial.println("released");
     }
@@ -656,18 +805,14 @@ void sendEmail(int message) {
   mail.begin();
   mail.setSubject(fromAddress, "Problem with chicken door");
   mail.addTo(toAddress);
-  //mail.addCC("name@email.com");
+
   if (message == 1) {
     mail.setBody("The clock could not be set.");
   }
   else if (message == 2) {
-    mail.setBody("The chicken door was sent down MaxAttempts times but it failed.");
+    mail.setBody("Calibration failed.");
   }
-  else if (message == 3) {
-    mail.setBody("The chicken door was sent up MaxAttempts times but it failed.");
-  }
-  //mail.setHTMLBody("This is an example html <b>e-mail<b/>.\n<u>Regards</u>");
-  
+
   if (mail.send(smtpServer, 587, emailAccount, emailPassword) == 0) {
     Serial.println("Mail sent OK");
   }
@@ -750,7 +895,7 @@ void loop() {
   }
 
   // Sample the door sensors
-  if (UseUpperSensor || UseLowerSensor) {
+  if (CalibrateUsingSensor || UseLowerSensor) {
     detectSensors();
   }
 
@@ -780,7 +925,7 @@ void loop() {
 
     // Start measurement
     bme.takeForcedMeasurement();
-    
+
     // Temperature
     temperature = bme.readTemperature();
     humidity = bme.readHumidity();
@@ -795,7 +940,7 @@ void loop() {
   switch (stateMachineState)
   {
   //==============================================================
-  //  State 'Initial' 
+  // State 'Initial' 
   //==============================================================
   case Initial:
 
@@ -806,24 +951,19 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
-      // Use the sensors to initialize the state machine
-      if (UseUpperSensor && upperSensorDetected) {
-        stateMachineState = Up;
-      }
-      else if (UseLowerSensor && lowerSensorDetected) {
+      // Because we move away from the upper sensor after moving up, 
+      // only use the lower sensor to determine the position of the door
+      if (UseLowerSensor && lowerSensorDetected) {
         stateMachineState = Down;
       }
-      else if (!UseUpperSensor) {
-        stateMachineState = Up; // Assume it's in the Up position
-      }
       else {
-        stateMachineState = MovingUp; // Start the move to the Up position
+        stateMachineState = Up;
       }
     }
     break;
 
   //==============================================================
-  //  State 'Up' 
+  // State 'Up' 
   //==============================================================
   case Up:
 
@@ -837,40 +977,79 @@ void loop() {
 
     // Transitions
     if (!stateChanged) {
-      // Move down a little bit so the sensor won't be triggered all the time
-      if (upperSensorDetected && !upperSensorCleared) {
-        stateMachineState = ClearingSensor;
-        upperSensorCleared = true;  // Clear the sensor only once
-      }      
+      // In the night, when there is no interference from the sun on the IR sensor, the
+      // position of the door is calibrated by moving it up until the sensor is triggered.
+      if (CalibrateUsingSensor && !calibrationFailed && !doorCalibrated &&
+          hour() == HourCalibration && minute() == MinuteCalibration) {
+        if (upperSensorDetected) {
+          // Calibrate by moving down a little bit so the sensor isn't triggered
+          stateMachineState = ClearingSensor;
+        }
+        else {
+          // Move up until the sensor is triggered
+          stateMachineState = MovingIntoSensor;
+        }
+        doorCalibrated = true;
+      }
+
       // Close the door if the temperature goes below the treshold and it is night OR
       // when it is just before sunset and we want to keep the chicken inside a bit longer
-      else if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sunSet || t_now < sunRise) && (attempt < MaxAttempts)) ||
-               (UseClock && (t_now >= closingTime) && (t_now < closingTime + 4) && (attempt < MaxAttempts)) ||
-               webCommand == DownCmd)
+      if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sunSet || t_now < sunRise)) ||
+        (UseClock && (t_now >= closingTime) && (t_now < closingTime + 4)) ||
+        webCommand == DownCmd)
       {
         webCommand = NoCmd;
         stateMachineState = MovingDown;
-        upperSensorCleared = false;
       }
       else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
         prevState = Up;
         stateMachineState = Moving1Sec;
       }
-      // Wait until the next day before resetting attempt
-      else if (t_now > sunRise && t_now < sunSet && attempt > 0) {
-        attempt = 0;
-      }
     }
     break;
 
   //==============================================================
-  //  State 'ClearingSensor' 
+  // State 'MovingIntoSensor'
+  // This state if for calibrating the position of the door using
+  // the upper sensor. The door will move up a bit to find the
+  // sensor. If the sensor is not found, the calibration
+  // procedure is aborted and not done again until a reboot.
+  //==============================================================
+  case MovingIntoSensor:
+
+    // Actions on entry
+    if (stateChanged) {
+      Serial.println("State: MovingIntoSensor");
+      startMovingMillis = millis();
+      moveDoor(Slow, UpDir);
+    }
+
+    // Continuous actions
+
+    // Transitions
+    if (!stateChanged) {
+      if (upperSensorDetected) {
+        moveDoor(Stop, DownDir);
+        stateMachineState = ClearingSensor;
+      }
+      else if (millis() - startMovingMillis > CalibrationMoveMillis) {
+        Serial.println("Calibration timed out");
+        stateMachineState = Up;
+        calibrationFailed = true;
+        sendEmail(2);
+      }
+    }
+    break;
+    
+  //==============================================================
+  // State 'ClearingSensor' 
   //==============================================================
   case ClearingSensor:
 
     // Actions on entry
     if (stateChanged) {
       Serial.println("State: ClearingSensor");
+      startMovingMillis = millis();
       moveDoor(Slow, DownDir);
     }
 
@@ -881,20 +1060,23 @@ void loop() {
       if (!upperSensorDetected) {
         stateMachineState = Up;
       }
+      else if (millis() - startMovingMillis > CalibrationMoveMillis) {
+        Serial.println("Calibration timed out");
+        stateMachineState = Up;
+        calibrationFailed = true;
+        sendEmail(2);
+      }
     }
     break;
 
   //==============================================================
-  //  State 'MovingDown' 
+  // State 'MovingDown' 
   //==============================================================
   case MovingDown:
 
     // Actions on entry
     if (stateChanged) {
       Serial.println("State: MovingDown");
-
-      // Ring the buzzer to warn the chickens
-      startBuzzer();
 
       startMovingMillis = millis();
       moveDoor(Fast, DownDir);
@@ -905,27 +1087,23 @@ void loop() {
     // Transitions
     if (!stateChanged) {
       if ((UseLowerSensor && lowerSensorDetected) ||
-          (!UseLowerSensor && (millis() - startMovingMillis > DefMoveDownMillis)) ||
-          (webCommand == StopCmd))
+        (millis() - startMovingMillis > DownMoveMillis) ||
+        (webCommand == StopCmd))
       {
         webCommand = NoCmd;
         stateMachineState = Down;
-      }
-      else if (millis() - startMovingMillis > MaxMoveMillis) {
-        stateMachineState = MovingDownFailed;
       }
     }
     break;
 
   //==============================================================
-  //  State 'Down' 
+  // State 'Down' 
   //==============================================================
   case Down:
 
     // Actions on entry
     if (stateChanged) {
       Serial.println("State: Down");
-      stopBuzzer();
       moveDoor(Stop, DownDir);
     }
 
@@ -934,7 +1112,7 @@ void loop() {
     // Transitions
     if (!stateChanged) {
       if ((UseTemperature && ((temperature > ClosingTemperature) || (t_now > sunRise && t_now < sunSet))) ||
-          (UseClock && (dayOfWeek(now()) > 1) && (dayOfWeek(now()) < 7) && (hour() == HourOpen) && (minute() == MinuteOpen)) || 
+          (UseClock && (dayOfWeek(now()) > 1) && (dayOfWeek(now()) < 7) && (hour() == HourOpen) && (minute() == MinuteOpen)) ||
           (UseClock && (dayOfWeek(now()) == 1 || dayOfWeek(now()) == 7) && (hour() == WeekendHourOpen) && (minute() == WeekendMinuteOpen)) ||
           (webCommand == UpCmd))
       {
@@ -949,7 +1127,7 @@ void loop() {
     break;
 
   //==============================================================
-  //  State 'MovingUp' 
+  // State 'MovingUp' 
   //==============================================================
   case MovingUp:
 
@@ -961,73 +1139,21 @@ void loop() {
     }
 
     // Continuous actions
-    /* Detect motion */
 
     // Transitions
     if (!stateChanged) {
-      if ((UseUpperSensor && upperSensorDetected) ||
-          (!UseUpperSensor && (millis() - startMovingMillis > DefMoveUpMillis)) ||
+      if ((millis() - startMovingMillis > UpMoveMillis) ||
           (webCommand == StopCmd))
       {
         webCommand = NoCmd;
         stateMachineState = Up;
-      }
-      else if (millis() - startMovingMillis > MaxMoveMillis) {
-        stateMachineState = MovingUpFailed;
+        doorCalibrated = false;
       }
     }
     break;
 
   //==============================================================
-  //  State 'MovingDownFailed' 
-  //==============================================================
-  case MovingDownFailed:
-
-    // Actions on entry
-    if (stateChanged) {
-      Serial.println("State: MovingDownFailed");
-      stopBuzzer();
-      moveDoor(Stop, DownDir);
-      attempt++;
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if (true) {
-        stateMachineState = MovingUp;
-      }
-    }
-    break;
-
-  //==============================================================
-  //  State 'MovingUpFailed' 
-  //==============================================================
-  case MovingUpFailed:
-
-    // Actions on entry
-    if (stateChanged) {
-      Serial.println("State: MovingUpFailed");
-      moveDoor(Stop, DownDir);
-      attempt++;
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if (attempt > MaxAttempts) {
-        stateMachineState = Alarm;
-      }
-      else {
-        stateMachineState = MovingDown;
-      }
-    }
-    break;
-
-  //==============================================================
-  //  State 'Moving1Sec' 
+  // State 'Moving1Sec' 
   //==============================================================
   case Moving1Sec:
 
@@ -1037,7 +1163,7 @@ void loop() {
       if (webCommand == Move1SecUpCmd) {
         Serial.println("Up");
         moveDoor(Fast, UpDir);
-      } 
+      }
       else {
         Serial.println("Down");
         moveDoor(Fast, DownDir);
@@ -1060,27 +1186,6 @@ void loop() {
       }
     }
     break;
-
-  //==============================================================
-  //  State 'Alarm' 
-  //==============================================================
-  case Alarm:
-
-    // Actions on entry
-    if (stateChanged) {
-      Serial.println("State: Alarm");
-      
-      // Send email
-      sendEmail(3);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-        // Dead end
-    }
-    break;
   }
 
   // Update state variables
@@ -1089,7 +1194,8 @@ void loop() {
 
   if (clientActive) {
     delay(1);
-  } else {
+  }
+  else {
     delay(10);
   }
 }
