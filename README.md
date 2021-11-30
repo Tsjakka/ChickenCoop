@@ -58,3 +58,9 @@ The full list of hardware is:
 * Power supply for the motor (12V)
 * Micro USB cable - 1.8m
 * Various pieces of wire
+
+# What it looks like
+
+![The coop](https://github.com/Tsjakka/ChickenCoop/blob/master/Photos/ChickenCoop.jpg)
+
+In the Photos directory you can find some more photos and a movie showing the door in motion.
