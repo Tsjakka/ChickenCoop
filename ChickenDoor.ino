@@ -24,7 +24,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <Adafruit_BME280.h>
-#include <ESPMail.h>
+#include <ESP_Mail_Client.h>
 #include <ESP_EEPROM.h>
 
 // ************************************************************************
@@ -33,7 +33,7 @@
 
 const float Latitude = 0.0000000;           // Replace with your coordinates
 const float Longitude = 0.000000;
-int Timezone = 120;                         // UTC difference in minutes (including DST)
+int Timezone = 60;                          // UTC difference in minutes (can be changed through web page)
 
 // At least one of the following booleans must be true.
 const bool UseTemperature = false;          // Use the temperature for deciding when to open and close the door (otherwise it's time based)
@@ -43,13 +43,12 @@ const bool UseClock = true;                 // Use the clock for deciding when t
 const float ClosingTemperature = 0;         // Close the door at night when the temperature goes below this value
 const time_t LoopPeriod = 180;              // Number of seconds between checks
 
-// Open and closing times
+// Open and closing times (can be changed through web page)
 uint8_t CloseBeforeSunriseMinutes = 120;    // The number of minutes before sunrise we close the coop
 uint8_t HourOpen = 7;                       // The time the chickens may leave the coop
 uint8_t MinuteOpen = 20;
 uint8_t WeekendHourOpen = 7;                // The time the chickens may leave the coop in the weekend
 uint8_t WeekendMinuteOpen = 20;
-time_t closingTime = 0;                     // The time the door will close today
 uint8_t HourCalibration = 1;                // Hour when to calibrate the position of the door
 uint8_t MinuteCalibration = 0;              // Minute when to calibrate the position of the door
 
@@ -58,21 +57,11 @@ const char* ssid = "REPLACE_WITH_YOUR_SSID";
 const char* password = "REPLACE_WITH_YOUR_PASSWORD";
 const time_t connectPeriod = 90;            // Max period (in s) for setting up a wifi connection
 
-// Variable to store the HTTP request
-String header;
-
 // NTP stuff
 char* NtpServer = "time.windows.com";       // A reliable NTP server ("time.nist.gov" didn't work so well)
 const unsigned int localPort = 2390;        // Local port to listen for UDP packets
 const int NtpPacketSize = 48;               // NTP time stamp is in the first 48 bytes of the message
 const time_t UpdateTimeTimeout = 300;       // Time (in seconds) we will try updating the clock
-
-byte packetBuffer[NtpPacketSize];           // Buffer to hold incoming and outgoing packets
-time_t updateTimeStarted;                   // The time when we started updating the clock
-bool ntpTimeSet = false;                    // Has the time been set through NTP?
-bool emailSent = false;                     // Has an email been sent because setting the time failed?
-int lastSecond = -1;                        // The second we last did stuff for NTP
-bool settingSunRiseSunSet = false;          // True when setting the sunrise and sunset
 
 // Email
 char* fromAddress = "REPLACE_WITH_YOUR_EMAIL";       // The address you want alarm messages sent from
@@ -145,20 +134,37 @@ String currentLine = "";                    // A string to hold incoming data fr
 time_t clientConnectedAt;
 const time_t webConnectPeriod = 30;         // Max timeout period (in s) for HTTP connections
 
-// A UDP instance to let us send and receive packets over UDP
-WiFiUDP Udp;
+// Variable to store the HTTP request
+String header;
 
-Command webCommand = NoCmd;
+WiFiUDP Udp;                                // A UDP instance for sending and receiving packets over UDP
+byte packetBuffer[NtpPacketSize];           // Buffer to hold incoming and outgoing packets
+time_t updateTimeStarted;                   // The time when we started updating the clock
+bool ntpTimeSet = false;                    // Has the time been set through NTP?
+bool emailSent = false;                     // Has an email been sent because setting the time failed?
+int lastSecond = -1;                        // The second we last did stuff for NTP
+bool settingSunRiseSunSet = false;          // True when setting the sunrise and sunset
+
+// The SMTP session object used for email sending
+SMTPSession smtp;
+
+// Callback function to get the email sending status
+void smtpCallback(SMTP_Status status);
+
+// Daylight Saving Time (0 or 60 minutes, calculated from current date)
+int DST = 0;
 
 // For sunrise and sunset
 sunMoon sm;
 time_t sunRise = 0;
 time_t sunSet = 0;
+time_t closingTime = 0;                     // The time the door will close today
 
 enum StateMachineState stateMachineState = NotRunning;
 enum StateMachineState previousStateMachineState = NotRunning;
 enum StateMachineState prevState = NotRunning;                  // Used for returning to the previous state when moving 1 second
-bool stateChanged = true;  // Start with entry code
+bool stateChanged = true;   // Start with entry code
+Command webCommand = NoCmd; // Command given through the web interface
 
 bool CalibrateUsingSensor = true;           // Calibrate the door position using a sensor at the top position of the door
 bool UseLowerSensor = false;                // Use a sensor to detect when the door is closed
@@ -177,6 +183,8 @@ volatile time_t previousCheckAt = 0;
 float temperature;
 float humidity;                             // Informational
 float pressure;                             // Informational
+
+String debugText = "";                      // A string to hold all debug text
 
 // The setup function that initializes everything
 void setup() {
@@ -208,7 +216,7 @@ void setup() {
 
   if (WiFi.waitForConnectResult() == WL_CONNECTED) {
     // Print local IP address and start web server
-    Serial.println("Wi-Fi connected.");
+    Serial.println("Wi-Fi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
 
@@ -243,11 +251,11 @@ void setup() {
   // When using the temperature, initialize the BME280
   if (Bme280Present) {
     // Check for the BME280 sensor
-    Serial.println(F("Starting BME280 sensor"));
+    printLine("Starting BME280 sensor");
     if (bme.begin(0x76)) {
       // Scenario for weather monitoring
-      Serial.println("Setting BME280 to weather station scenario:");
-      Serial.println("  Forced mode, 1x temperature / 1x humidity / 1x pressure oversampling, filter off");
+      printLine("Setting BME280 to weather station scenario:");
+      printLine("  Forced mode, 1x temperature / 1x humidity / 1x pressure oversampling, filter off");
       bme.setSampling(Adafruit_BME280::MODE_FORCED,
         Adafruit_BME280::SAMPLING_X1, // Temperature
         Adafruit_BME280::SAMPLING_X1, // Pressure
@@ -255,7 +263,7 @@ void setup() {
         Adafruit_BME280::FILTER_OFF);
     }
     else {
-      Serial.println(F("Could not find a valid BME280 sensor, please check wiring."));
+      printLine("Could not find a valid BME280 sensor, please check wiring.");
       Bme280Present = false;
     }
   }
@@ -282,9 +290,12 @@ void setup() {
 
   // For NTP
   Udp.begin(localPort);
-  Serial.println("Started listening for UDP packets.");
+  printLine("Started listening for UDP packets");
   updateTimeStarted = now();
 
+  // Set the callback function to get email sending results
+  smtp.callback(smtpCallback);
+  
   // Start the webserver
   server.begin();
 }
@@ -313,7 +324,7 @@ time_t getNtpTime() {
 
   // Check if a reply is available
   if (Udp.parsePacket()) {
-    Serial.println("Packet received");
+    printLine("Packet received");
 
     // We've received a packet, read the data from it
     Udp.read(packetBuffer, NtpPacketSize); // Read the packet into the buffer
@@ -327,8 +338,8 @@ time_t getNtpTime() {
     // Combine the four bytes (two words) into a long integer
     // this is NTP time (seconds since Jan 1 1900):
     unsigned long secsSince1900 = highWord << 16 | lowWord;
-    Serial.print("Seconds since Jan 1 1900 = ");
-    Serial.println(secsSince1900);
+    printNoLine("Seconds since Jan 1 1900 = ");
+    printLine(String(secsSince1900));
 
     // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
     const unsigned long seventyYears = 2208988800UL;
@@ -336,14 +347,33 @@ time_t getNtpTime() {
     // Subtract seventy years:
     unsigned long epoch = secsSince1900 - seventyYears;
 
-    Serial.print("UTC time is: ");
+    printNoLine("UTC time is: ");
     printDateTime(epoch);
-    Serial.println();
+    printLine("");
 
     result = epoch;
   }
 
   return result;
+}
+
+// Daylight Saving Time starts at 2 a.m. on the last Sunday in March. The clock is then set 1 hour
+// ahead to 3 o'clock. So this Sunday lasts only 23 hours; an hour shorter than a normal day.
+// Winter time starts at 3 a.m. on the last Sunday in the month of October. The time is
+// then reset 1 hour to 2 hours. In practice this means that this day lasts 25 hours.
+// This function sets the global variable DST to 60 (minutes) when daylight saving time is active.
+// Note that it does not look at the time to make this determination, so DST is set to 60 during the
+// last Sunday in March and set to 0 during the last Sunday in October.
+// Note: dayOfWeek(SUN) = 1, dayOfWeek(MON) = 2, etc.
+void calcDST() {
+  DST = 0;
+  
+  // Check if today is a DST day
+  if ((month() == 3 && day() >= 25 && dayOfWeek(now()) <= day() - 24) || 
+      (month() == 10 && (day() < 25 || (day() >= 25 && day() - dayOfWeek(now()) <= 23))) || 
+      (month() > 3 && month() < 10)) {
+    DST = 60;
+  }
 }
 
 //void printDigits(int digits) {
@@ -369,11 +399,22 @@ time_t getNtpTime() {
 //  Serial.print(" ");
 //}
 
+// Two functions to handle debug messages
+void printNoLine(String text) {
+  debugText += text;
+  Serial.print(text);
+}
+
+void printLine(String text) {
+  debugText += text + "<br>\n";
+  Serial.println(text);
+}
+
 void printDateTime(time_t date) {
   char buff[20];
   sprintf(buff, "%2d-%02d-%4d %02d:%02d:%02d",
     day(date), month(date), year(date), hour(date), minute(date), second(date));
-  Serial.print(buff);
+  printNoLine(buff);
 }
 
 void moveDoor(Speed speed, Direction direction) {
@@ -384,23 +425,23 @@ void moveDoor(Speed speed, Direction direction) {
 
   // Write new motor direction and speed
   if (speed == Fast && direction == DownDir) {
-    Serial.println("Moving down fast...");
+    printLine("Moving down fast...");
     analogWrite(L9110_A_IA, PwmFast); // PWM speed = fast
   }
   else if (speed == Slow && direction == DownDir) {
-    Serial.println("Moving down slowly...");
+    printLine("Moving down slowly...");
     analogWrite(L9110_A_IA, PwmSlow); // PWM speed = slow
   }
   else if (speed == Fast && direction == UpDir) {
-    Serial.println("Moving up fast...");
+    printLine("Moving up fast...");
     analogWrite(L9110_A_IB, PwmFast); // PWM speed = fast
   }
   else if (speed == Slow && direction == UpDir) {
-    Serial.println("Moving up slowly...");
+    printLine("Moving up slowly...");
     analogWrite(L9110_A_IB, PwmSlow); // PWM speed = slow
   }
   else if (speed == Stop) {
-    Serial.println("Stop...");
+    printLine("Stop...");
     // Already done at top of function
   }
 }
@@ -412,9 +453,9 @@ void handleWebClient() {
     client = server.available();            // Listen for incoming clients
     if (client) {                           // If a new client connects
       clientConnectedAt = now();
-      Serial.print("New client connection at ");
+      printNoLine("New client connection at ");
       printDateTime(clientConnectedAt);
-      Serial.println();
+      printLine("");
       clientActive = true;
       currentLine = "";
     }
@@ -438,37 +479,37 @@ void handleWebClient() {
 
             // Handle user input
             if (header.indexOf("GET /up1sec") >= 0) {
-              Serial.println("Up for 1 second selected");
+              printLine("Up for 1 second selected");
               webCommand = Move1SecUpCmd;
             }
             else if (header.indexOf("GET /down1sec") >= 0) {
-              Serial.println("Down for 1 second selected");
+              printLine("Down for 1 second selected");
               webCommand = Move1SecDownCmd;
             }
             else if (header.indexOf("GET /down") >= 0) {
-              Serial.println("Down selected");
+              printLine("Down selected");
               webCommand = DownCmd;
             }
             else if (header.indexOf("GET /up") >= 0) {
-              Serial.println("Up selected");
+              printLine("Up selected");
               webCommand = UpCmd;
             }
             else if (header.indexOf("GET /stop") >= 0) {
-              Serial.println("Stop selected");
+              printLine("Stop selected");
               webCommand = StopCmd;
             }
             else if (header.indexOf("GET /params") >= 0) {
               // Find first parameter
               int begin = header.indexOf('?');
               int end = header.indexOf('&');
-              Serial.print("begin=");
-              Serial.print(begin);
-              Serial.print(" end=");
-              Serial.println(end);
+              printNoLine("begin=");
+              printNoLine(String(begin));
+              printNoLine(" end=");
+              printLine(String(end));
               if (begin > -1 && end > begin + 1) {
                 String sub = header.substring(begin + 1, end);
-                Serial.print("Substring: ");
-                Serial.println(sub);
+                printNoLine("Substring: ");
+                printLine(sub);
 
                 // Split parameter in name and value. Repeat for all parameters
                 bool dataPresent = true;
@@ -478,10 +519,10 @@ void handleWebClient() {
                   if (equalsPos > -1) {
                     String param = sub.substring(0, equalsPos);
                     String value = sub.substring(equalsPos + 1, sub.length());
-                    Serial.print("Parsed ");
-                    Serial.print(param);
-                    Serial.print(" = ");
-                    Serial.println(value);
+                    printNoLine("Parsed ");
+                    printNoLine(param);
+                    printNoLine(" = ");
+                    printLine(value);
 
                     // Check for and set the variables
                     long temp;
@@ -550,15 +591,15 @@ void handleWebClient() {
                       end = header.length();
                     }
                   }
-                  Serial.print("begin=");
-                  Serial.print(begin);
-                  Serial.print(" end=");
-                  Serial.println(end);
+                  printNoLine("begin=");
+                  printNoLine(String(begin));
+                  printNoLine(" end=");
+                  printLine(String(end));
 
                   if (end > begin + 1) {
                     sub = header.substring(begin, end);
-                    Serial.print("Substring: ");
-                    Serial.println(sub);
+                    printNoLine("Substring: ");
+                    printLine(sub);
                   }
                 } while (!invalidParam && end > begin + 1);
 
@@ -578,13 +619,13 @@ void handleWebClient() {
   
                 // Write the data to EEPROM
                 bool ok = EEPROM.commit();
-                Serial.println((ok) ? "Commit OK" : "Commit failed");
+                printLine((ok) ? "Commit OK" : "Commit failed");
               }
             }
 
             time_t t_now = now();
             printDateTime(t_now);
-            Serial.println();
+            printLine("");
 
             // Display the HTML web page
             client.println("<!DOCTYPE html><html>");
@@ -698,6 +739,10 @@ void handleWebClient() {
             client.println("<input type=\"submit\" value=\"Submit\">");
             client.println("</form>");
 
+            client.print("<p>");
+            client.print(debugText);
+            client.println("</p>");
+              
             client.println("</body></html>");
 
             // The HTTP response ends with another blank line
@@ -708,8 +753,8 @@ void handleWebClient() {
 
             // Close the connection
             client.stop();
-            Serial.println("Client disconnected");
-            Serial.println("");
+            printLine("Client disconnected");
+            printLine("");
 
             clientActive = false;
           }
@@ -725,13 +770,13 @@ void handleWebClient() {
         // The client is connected but no data is available. Time out if this takes too long.
         if (now() > clientConnectedAt + webConnectPeriod) {
           clientActive = false;
-          Serial.println("Client connection timed out");
+          printLine("Client connection timed out");
         }
       }
     }
     else {
       clientActive = false;
-      Serial.println("Client no longer connected");
+      printLine("Client no longer connected");
     }
   }
 }
@@ -742,11 +787,11 @@ void setSunriseSunsetClosingTime() {
   sm.init(Timezone, Latitude, Longitude);
   sunRise = sm.sunRise();
   sunSet = sm.sunSet();
-  Serial.print("Today's sunrise and sunset: ");
+  printNoLine("Today's sunrise and sunset: ");
   printDateTime(sunRise);
-  Serial.print(", ");
+  printNoLine(", ");
   printDateTime(sunSet);
-  Serial.println();
+  printLine("");
 
   // The time for closing the door is <CloseBeforeSunriseMinutes> before sunset 
   // or opening time, whichever comes first.
@@ -760,16 +805,16 @@ void setSunriseSunsetClosingTime() {
   time_t openingTime = makeTime(openingTimeElements);
 
   if (openingTime < sunRise) {
-    Serial.println("The time for opening is before sunset.");
+    printLine("The time for opening is before sunrise");
     closingTime = openingTime - (CloseBeforeSunriseMinutes * 60);
   }
   else {
     closingTime = sunRise - (CloseBeforeSunriseMinutes * 60);
   }
 
-  Serial.print("Closing the door today at: ");
+  printNoLine("Closing the door today at: ");
   printDateTime(closingTime);
-  Serial.println();
+  printLine("");
 }
 
 bool detectSensors() {
@@ -777,22 +822,22 @@ bool detectSensors() {
   lowerSensorDetected = !digitalRead(LowerSensorPin);
 
   if (upperSensorDetected != previousUpperSensorDetected) {
-    Serial.print("Upper sensor ");
+    printNoLine("Upper sensor ");
     if (upperSensorDetected) {
-      Serial.println("triggered");
+      printLine("triggered");
     }
     else {
-      Serial.println("released");
+      printLine("released");
     }
     previousUpperSensorDetected = upperSensorDetected;
   }
   if (lowerSensorDetected != previousLowerSensorDetected) {
-    Serial.print("Lower sensor ");
+    printNoLine("Lower sensor ");
     if (lowerSensorDetected) {
-      Serial.println("triggered");
+      printLine("triggered");
     }
     else {
-      Serial.println("released");
+      printLine("released");
     }
     previousLowerSensorDetected = lowerSensorDetected;
   }
@@ -800,24 +845,56 @@ bool detectSensors() {
   return true;
 }
 
-void sendEmail(int message) {
-  ESPMail mail;
-  mail.begin();
-  mail.setSubject(fromAddress, "Problem with chicken door");
-  mail.addTo(toAddress);
+void sendEmail(int selectMessage) {
+  ESP_Mail_Session session; // Session config data
+  SMTP_Message message;     // Message class
 
-  if (message == 1) {
-    mail.setBody("The clock could not be set.");
+  // Set the session config
+  session.server.host_name = smtpServer;
+  session.server.port = 587;
+  session.login.email = emailAccount;
+  session.login.password = emailPassword;
+  session.login.user_domain = "";
+
+  // Set message headers
+  message.sender.name = "ChickenDoor";
+  message.sender.email = fromAddress;
+  message.subject = "Problem with chicken door";
+  message.addRecipient("Me", toAddress);
+
+  // Create raw text message
+  if (selectMessage == 1) {
+    message.text.content = "The clock could not be set.";
   }
-  else if (message == 2) {
-    mail.setBody("Calibration failed.");
+  else if (selectMessage == 2) {
+    message.text.content = "Calibration failed.";
   }
 
-  if (mail.send(smtpServer, 587, emailAccount, emailPassword) == 0) {
-    Serial.println("Mail sent OK");
+  message.text.charSet = "us-ascii";
+  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+  
+  message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+  message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;
+
+  // Connect to server with the session config
+  if (!smtp.connect(&session)) {
+    return;
   }
-  else {
-    Serial.println("Error when sending mail");
+
+  // Send email and close the session
+  if (!MailClient.sendMail(&smtp, &message)) {
+    printLine("Error sending Email, " + smtp.errorReason());
+  }
+}
+
+// Callback function to get the email sending status
+void smtpCallback(SMTP_Status status){
+  // Print the current status
+  printLine(status.info());
+
+  /* Print the sending result */
+  if (status.success()){
+    printLine("Mail sent OK");
   }
 }
 
@@ -829,24 +906,31 @@ void loop() {
     if ((now() < updateTimeStarted + UpdateTimeTimeout) && (lastSecond != second())) {
       // Send a packet every 30 seconds and check for an answer the other times
       if (second() % 30 == 8) {
-        Serial.print("Requesting time from NTP server at ");
+        printNoLine("Requesting time from NTP server at ");
         printDateTime(now());
-        Serial.println();
+        printLine("");
 
         // Send an NTP packet to a time server
         if (sendNtpPacket(NtpServer) == 0) {
-          Serial.print(F("DNS lookup failed for "));
-          Serial.println(NtpServer);
+          printNoLine("DNS lookup failed for ");
+          printLine(NtpServer);
         }
       }
       else {
         // Check for received packets
         time_t epoch = getNtpTime();
         if (epoch > 0) {
-          Serial.print("Setting the system time to UTC + ");
-          Serial.print(Timezone);
-          Serial.println(" minutes");
-          setTime(epoch + Timezone * 60);
+          calcDST();
+          printNoLine("Daylight Saving Time ");
+          if (DST == 0) {
+            printNoLine("not ");
+          }
+          printLine("active");
+
+          printNoLine("Setting system time to UTC + ");
+          printNoLine(String(Timezone + DST));
+          printLine(" minutes");
+          setTime(epoch + (Timezone + DST) * 60);
           ntpTimeSet = true;
 
           setSunriseSunsetClosingTime();
@@ -875,17 +959,12 @@ void loop() {
   else {
     // Make sure the clock and sunrise/sunset are updated once a week on wednesdays afternoons
     if (ntpTimeSet && dayOfWeek(now()) == 4 && hour() == 12 && minute() == 5 && second() == 59) {
-      Serial.print("Invalidating time at ");
+      printNoLine("Invalidating time at ");
       printDateTime(now());
-      Serial.println();
+      printLine("");
       ntpTimeSet = false;
       updateTimeStarted = now();
       emailSent = false;
-
-      // Stop running the state machine, make sure it only runs on a correct clock
-      stateMachineState = NotRunning;
-      stateChanged = (stateMachineState != previousStateMachineState);
-      previousStateMachineState = stateMachineState;
     }
   }
 
@@ -901,13 +980,14 @@ void loop() {
 
   time_t t_now = now();   // The number of seconds since Jan 1 1970
 
-  // Every day, a little after midnight, calculate the next sunrise and sunset and time for closing the door
-  if (!settingSunRiseSunSet && hour() == 0 && minute() == 5 && second() == 0) {
+  // Every day at two a.m. calculate DST, the next sunrise and sunset and the time for closing the door
+  if (!settingSunRiseSunSet && hour() == 2 && minute() == 0 && second() == 0) {
     settingSunRiseSunSet = true;
-    Serial.println("Calculating sunrise and sunset at ");
+    printLine("Calculating sunrise and sunset at ");
     printDateTime(t_now);
-    Serial.println();
+    printLine("");
 
+    calcDST();
     setSunriseSunsetClosingTime();
   }
   else if (settingSunRiseSunSet && second() != 0) {
@@ -927,9 +1007,9 @@ void loop() {
     bme.takeForcedMeasurement();
 
     // Temperature
-    temperature = bme.readTemperature();
-    humidity = bme.readHumidity();
-    pressure = bme.readPressure() / 100.0F;
+    temperature = bme.readTemperature() - 2.4;    // Correction for my BME280
+    humidity = bme.readHumidity() - 9.0;          // Correction for my BME280
+    pressure = bme.readPressure() / 100.0F + 2.1; // Correction for my BME280
     printf("Temperature: %0.1f*C, humidity: %0.f%%, pressure: %0.1f hPa\r\n", temperature, humidity, pressure);
   }
 
@@ -946,13 +1026,13 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: Initial");
+      printLine("State: Initial");
     }
 
     // Transitions
     if (!stateChanged) {
-      // Because we move away from the upper sensor after moving up, 
-      // only use the lower sensor to determine the position of the door
+      // Because we clear the upper sensor after moving up, only use the
+      // (optional) lower sensor to determine the position of the door
       if (UseLowerSensor && lowerSensorDetected) {
         stateMachineState = Down;
       }
@@ -969,7 +1049,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: Up");
+      printLine("State: Up");
       moveDoor(Stop, DownDir);
     }
 
@@ -1019,7 +1099,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: MovingIntoSensor");
+      printLine("State: MovingIntoSensor");
       startMovingMillis = millis();
       moveDoor(Slow, UpDir);
     }
@@ -1033,9 +1113,10 @@ void loop() {
         stateMachineState = ClearingSensor;
       }
       else if (millis() - startMovingMillis > CalibrationMoveMillis) {
-        Serial.println("Calibration timed out");
+        printLine("Calibration timed out");
         stateMachineState = Up;
         calibrationFailed = true;
+        moveDoor(Stop, DownDir); // Just in case something goes wrong when sending the email
         sendEmail(2);
       }
     }
@@ -1048,7 +1129,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: ClearingSensor");
+      printLine("State: ClearingSensor");
       startMovingMillis = millis();
       moveDoor(Slow, DownDir);
     }
@@ -1061,9 +1142,10 @@ void loop() {
         stateMachineState = Up;
       }
       else if (millis() - startMovingMillis > CalibrationMoveMillis) {
-        Serial.println("Calibration timed out");
+        printLine("Calibration timed out");
         stateMachineState = Up;
         calibrationFailed = true;
+        moveDoor(Stop, DownDir); // Just in case something goes wrong when sending the email
         sendEmail(2);
       }
     }
@@ -1076,7 +1158,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: MovingDown");
+      printLine("State: MovingDown");
 
       startMovingMillis = millis();
       moveDoor(Fast, DownDir);
@@ -1103,7 +1185,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: Down");
+      printLine("State: Down");
       moveDoor(Stop, DownDir);
     }
 
@@ -1133,7 +1215,7 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.println("State: MovingUp");
+      printLine("State: MovingUp");
       startMovingMillis = millis();
       moveDoor(Fast, UpDir);
     }
@@ -1159,13 +1241,13 @@ void loop() {
 
     // Actions on entry
     if (stateChanged) {
-      Serial.print("State: Moving1Sec ");
+      printNoLine("State: Moving1Sec ");
       if (webCommand == Move1SecUpCmd) {
-        Serial.println("Up");
+        printLine("Up");
         moveDoor(Fast, UpDir);
       }
       else {
-        Serial.println("Down");
+        printLine("Down");
         moveDoor(Fast, DownDir);
       }
       webCommand = NoCmd;
