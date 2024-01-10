@@ -1,20 +1,22 @@
 /***************************************************************************
-  This sketch automates my chicken coop. It closes and opens the door
+  This sketch automates my chicken coop door. It closes and opens the door
   based on the time of day or on the outside temperature, sunrise and sunset.
   A DC motor is used to move the door up and down.
   Optionally, optical reflection sensors are used to control the up and down
   movement of the door.
-  Various information, such as the status of the door, is presented on a web
-  page. The position of the door can be calibrated using the web page.
+  Various information, such as the position of the door, is presented on a
+  web page. The position of the door can be calibrated using the web page.
 
   This sketch uses code from the following websites:
   https://randomnerdtutorials.com/esp8266-web-server/
   https://www.bananarobotics.com/shop/How-to-use-the-HG7881-(L9110)-Dual-Channel-Motor-Driver-Module
   https://www.arduino.cc/en/Tutorial/UdpNTPClient
   https://github.com/sfrwmaker/sunMoon
+  https://github.com/mobizt/ESP-Mail-Client
+  https://github.com/jwrw/ESP_EEPROM
 
   Written by Tsjakka from the Netherlands.
-  BSD license, all text above must be included in any redistribution.
+  BSD license, this line and all text above must be included in any redistribution.
  ***************************************************************************/
 
 #include <math.h>
@@ -31,19 +33,19 @@
 // Change the constants below to adjust the software to your situation
 // ************************************************************************
 
+// GPIO
+const int L9110_A_IA = 12;                  // Motor A Input A --> MOTOR A +
+const int L9110_A_IB = 14;                  // Motor A Input B --> MOTOR A -
+const int UpperSensorPin = 13;              // Digital output of upper TCRT5000 Tracking Sensor Module
+const int LowerSensorPin = 16;              // Digital output of lower TCRT5000 Tracking Sensor Module
+
+// Regional settings
 const float Latitude = 0.0000000;           // Replace with your coordinates
 const float Longitude = 0.000000;
 int Timezone = 60;                          // UTC difference in minutes (can be changed through web page)
+bool UseDST = true;                         // Indicates whether Daylight Saving Time is observed in your region or not.
 
-// At least one of the following booleans must be true.
-const bool UseTemperature = false;          // Use the temperature for deciding when to open and close the door (otherwise it's time based)
-const bool UseClock = true;                 // Use the clock for deciding when to open and close the door (otherwise it's temperature based)
-
-// For reading the temperature.
-const float ClosingTemperature = 0;         // Close the door at night when the temperature goes below this value
-const time_t LoopPeriod = 180;              // Number of seconds between checks
-
-// Open and closing times (can be changed through web page)
+// Opening and closing times (can be changed through the web page)
 uint8_t CloseBeforeSunriseMinutes = 120;    // The number of minutes before sunrise we close the coop
 uint8_t HourOpen = 7;                       // The time the chickens may leave the coop
 uint8_t MinuteOpen = 20;
@@ -58,7 +60,7 @@ const char* password = "REPLACE_WITH_YOUR_PASSWORD";
 const time_t connectPeriod = 90;            // Max period (in s) for setting up a wifi connection
 
 // NTP stuff
-char* NtpServer = "time.windows.com";       // A reliable NTP server ("time.nist.gov" didn't work so well)
+const char* NtpServer = "time.windows.com"; // A reliable NTP server ("time.nist.gov" didn't work so well)
 const unsigned int localPort = 2390;        // Local port to listen for UDP packets
 const int NtpPacketSize = 48;               // NTP time stamp is in the first 48 bytes of the message
 const time_t UpdateTimeTimeout = 300;       // Time (in seconds) we will try updating the clock
@@ -70,12 +72,6 @@ char* smtpServer = "REPLACE_WITH_YOUR_SERVER";     // The server to use for send
 char* emailAccount = "REPLACE_WITH_YOUR_ACCOUNT";              // The email account on the server
 char* emailPassword = "REPLACE_WITH_YOUR_PASSWORD"; // The password for the email account
 
-// Wired connections
-const int L9110_A_IA = 12;                  // Motor A Input A --> MOTOR A +
-const int L9110_A_IB = 14;                  // Motor A Input B --> MOTOR A -
-const int UpperSensorPin = 13;              // Digital output of upper TCRT5000 Tracking Sensor Module
-const int LowerSensorPin = 16;              // Digital output of lower TCRT5000 Tracking Sensor Module
-
 // The actual values for "fast" and "slow" depend on the motor
 const int PwmSlow = 750;                    // Slow speed PWM duty cycle
 const int PwmFast = 1023;                   // Fast speed PWM duty cycle
@@ -86,7 +82,14 @@ long UpMoveMillis = 12900;                  // The default duration of an up mov
 long DownMoveMillis = 12700;                // The default duration of a down move. When using a lower sensor this is used when the sensor fails
 long CalibrationMoveMillis = 2500;          // The max. duration of the move used for calibrating the position of the door
 
+// At least one of the following booleans must be true
+const bool UseTemperature = false;          // Use the temperature for deciding when to open and close the door (otherwise it's time based)
+const bool UseClock = true;                 // Use the clock for deciding when to open and close the door (otherwise it's temperature based)
+
+// For reading the temperature.
 bool Bme280Present = true;                  // Initialize/use the BME280 or not
+const float ClosingTemperature = 0;         // Close the door at night when the temperature goes below this value
+const time_t LoopPeriod = 180;              // Number of seconds between checks
 
 // ************************************************************************
 // Change the constants above to adjust the software to your situation
@@ -113,8 +116,7 @@ enum Command {
 };
 
 // Stuff related to the state machine controlling the door
-enum StateMachineState
-{
+enum StateMachineState {
   NotRunning = 0,
   Initial = 1,
   Up = 2,
@@ -160,10 +162,11 @@ time_t sunRise = 0;
 time_t sunSet = 0;
 time_t closingTime = 0;                     // The time the door will close today
 
+// Related to main state machine
 enum StateMachineState stateMachineState = NotRunning;
 enum StateMachineState previousStateMachineState = NotRunning;
-enum StateMachineState prevState = NotRunning;                  // Used for returning to the previous state when moving 1 second
-bool stateChanged = true;   // Start with entry code
+enum StateMachineState prevState = NotRunning;  // Used for returning to the previous state when moving 1 second
+bool stateChanged = true;                       // Start with entry code
 Command webCommand = NoCmd; // Command given through the web interface
 
 bool CalibrateUsingSensor = true;           // Calibrate the door position using a sensor at the top position of the door
@@ -184,11 +187,21 @@ float temperature;
 float humidity;                             // Informational
 float pressure;                             // Informational
 
-String debugText = "";                      // A string to hold all debug text
+String debugText = "";                      // A string to hold all debug text (max. 24000 chars it turns out)
 
 // The setup function that initializes everything
 void setup() {
   Serial.begin(115200);
+
+  // Initialize motor
+  pinMode(L9110_A_IB, OUTPUT);
+  pinMode(L9110_A_IA, OUTPUT);
+  digitalWrite(L9110_A_IB, LOW);
+  digitalWrite(L9110_A_IA, LOW);
+
+  // Sensors
+  pinMode(UpperSensorPin, INPUT);
+  pinMode(LowerSensorPin, INPUT);
 
   // Initialize Wi-Fi. Force the ESP to reset Wi-Fi and initialize correctly.
   Serial.print("WiFi status = ");
@@ -199,7 +212,7 @@ void setup() {
   delay(1000);
   Serial.print("Wi-Fi status = ");
   Serial.println(WiFi.getMode());
-  // End initialization
+  // End Wi-Fi initialization
 
   // Connect to Wi-Fi network with SSID and password. Reboot if it continuously fails.
   Serial.print("Connecting to ");
@@ -229,24 +242,13 @@ void setup() {
     Serial.print("Signal strength (RSSI): ");
     Serial.print(rssi);
     Serial.println(" dBm");
-  }
-  else {
+  } else {
     WiFi.disconnect();
     Serial.println();
     Serial.println("No Wi-Fi connection established, rebooting");
     delay(5000);
     ESP.restart();
   }
-
-  // Initialize motor
-  pinMode(L9110_A_IB, OUTPUT);
-  pinMode(L9110_A_IA, OUTPUT);
-  digitalWrite(L9110_A_IB, LOW);
-  digitalWrite(L9110_A_IA, LOW);
-
-  // Sensors
-  pinMode(UpperSensorPin, INPUT);
-  pinMode(LowerSensorPin, INPUT);
 
   // When using the temperature, initialize the BME280
   if (Bme280Present) {
@@ -257,12 +259,11 @@ void setup() {
       printLine("Setting BME280 to weather station scenario:");
       printLine("  Forced mode, 1x temperature / 1x humidity / 1x pressure oversampling, filter off");
       bme.setSampling(Adafruit_BME280::MODE_FORCED,
-        Adafruit_BME280::SAMPLING_X1, // Temperature
-        Adafruit_BME280::SAMPLING_X1, // Pressure
-        Adafruit_BME280::SAMPLING_X1, // Humidity
+        Adafruit_BME280::SAMPLING_X1,  // Temperature
+        Adafruit_BME280::SAMPLING_X1,  // Pressure
+        Adafruit_BME280::SAMPLING_X1,  // Humidity
         Adafruit_BME280::FILTER_OFF);
-    }
-    else {
+    } else {
       printLine("Could not find a valid BME280 sensor, please check wiring.");
       Bme280Present = false;
     }
@@ -276,6 +277,7 @@ void setup() {
   EEPROM.get(0, dataPresent);
   if (dataPresent) {
     EEPROM.get(1, Timezone);
+    EEPROM.get(3, UseDST);
     EEPROM.get(5, CloseBeforeSunriseMinutes);
     EEPROM.get(6, HourOpen);
     EEPROM.get(7, MinuteOpen);
@@ -295,7 +297,7 @@ void setup() {
 
   // Set the callback function to get email sending results
   smtp.callback(smtpCallback);
-  
+
   // Start the webserver
   server.begin();
 }
@@ -308,11 +310,11 @@ int sendNtpPacket(const char* host) {
   memset(packetBuffer, 0, NtpPacketSize);
 
   // Initialize values needed to form NTP request
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[0] = 0b11100011;  // LI, Version, Mode
 
   // All needed NTP fields have been given values, now
   // send a packet requesting a timestamp
-  result = Udp.beginPacket(host, 123); // NTP requests are to port 123
+  result = Udp.beginPacket(host, 123);  // NTP requests are to port 123
   Udp.write(packetBuffer, NtpPacketSize);
   Udp.endPacket();
 
@@ -327,7 +329,7 @@ time_t getNtpTime() {
     printLine("Packet received");
 
     // We've received a packet, read the data from it
-    Udp.read(packetBuffer, NtpPacketSize); // Read the packet into the buffer
+    Udp.read(packetBuffer, NtpPacketSize);  // Read the packet into the buffer
 
     // The timestamp starts at byte 40 of the received packet and is four bytes,
     // or two words, long. First, esxtract the two words:
@@ -361,51 +363,39 @@ time_t getNtpTime() {
 // ahead to 3 o'clock. So this Sunday lasts only 23 hours; an hour shorter than a normal day.
 // Winter time starts at 3 a.m. on the last Sunday in the month of October. The time is
 // then reset 1 hour to 2 hours. In practice this means that this day lasts 25 hours.
-// This function sets the global variable DST to 60 (minutes) when daylight saving time is active.
-// Note that it does not look at the time to make this determination, so DST is set to 60 during the
-// last Sunday in March and set to 0 during the last Sunday in October.
+// This function determines whether DST is active on the date specified by parameter 'time'.
+// Note that it does not look at the time to make this determination, so it returns true for the
+// last Sunday in March, regardless of the time, and false for the last Sunday in October.
 // Note: dayOfWeek(SUN) = 1, dayOfWeek(MON) = 2, etc.
-void calcDST() {
-  DST = 0;
-  
-  // Check if today is a DST day
-  if ((month() == 3 && day() >= 25 && dayOfWeek(now()) <= day() - 24) || 
-      (month() == 10 && (day() < 25 || (day() >= 25 && day() - dayOfWeek(now()) <= 23))) || 
-      (month() > 3 && month() < 10)) {
-    DST = 60;
-  }
-}
+bool dstActive(time_t time) {
+  bool result = false;
+  int dayParam = day(time);
+  int monthParam = month(time);
+  int dayOfWeekParam = dayOfWeek(time);
 
-//void printDigits(int digits) {
-//  // Utility function for digital clock display: leading 0
-//  if (digits < 10) Serial.print('0');
-//  Serial.print(digits);
-//}
-//
-//void printDateTime(time_t dateTime, bool includeDate) {
-//  if (includeDate) {
-//    Serial.print(year(dateTime));
-//    Serial.print("-");
-//    printDigits(month(dateTime));
-//    Serial.print("-");
-//    printDigits(day(dateTime));
-//    Serial.print(" ");
-//  }
-//  printDigits(hour(dateTime));
-//  Serial.print(":");
-//  printDigits(minute(dateTime));
-//  Serial.print(":");
-//  printDigits(second(dateTime));
-//  Serial.print(" ");
-//}
+  // Check if today is a DST day
+  if ((monthParam == 3 && dayParam >= 25 && dayOfWeekParam <= dayParam - 24) ||
+      (monthParam == 10 && (dayParam < 25 || (dayParam >= 25 && dayParam - dayOfWeekParam <= 23))) ||
+      (monthParam > 3 && monthParam < 10)) {
+    result = true;
+  }
+
+  return result;
+}
 
 // Two functions to handle debug messages
 void printNoLine(String text) {
+  if (debugText.length() > 23800) {
+    debugText.remove(0, 1000);
+  }
   debugText += text;
   Serial.print(text);
 }
 
 void printLine(String text) {
+  if (debugText.length() > 23800) {
+    debugText.remove(0, 1000);
+  }
   debugText += text + "<br>\n";
   Serial.println(text);
 }
@@ -426,24 +416,48 @@ void moveDoor(Speed speed, Direction direction) {
   // Write new motor direction and speed
   if (speed == Fast && direction == DownDir) {
     printLine("Moving down fast...");
-    analogWrite(L9110_A_IA, PwmFast); // PWM speed = fast
-  }
-  else if (speed == Slow && direction == DownDir) {
+    analogWrite(L9110_A_IA, PwmFast);  // PWM speed = fast
+  } else if (speed == Slow && direction == DownDir) {
     printLine("Moving down slowly...");
-    analogWrite(L9110_A_IA, PwmSlow); // PWM speed = slow
-  }
-  else if (speed == Fast && direction == UpDir) {
+    analogWrite(L9110_A_IA, PwmSlow);  // PWM speed = slow
+  } else if (speed == Fast && direction == UpDir) {
     printLine("Moving up fast...");
-    analogWrite(L9110_A_IB, PwmFast); // PWM speed = fast
-  }
-  else if (speed == Slow && direction == UpDir) {
+    analogWrite(L9110_A_IB, PwmFast);  // PWM speed = fast
+  } else if (speed == Slow && direction == UpDir) {
     printLine("Moving up slowly...");
-    analogWrite(L9110_A_IB, PwmSlow); // PWM speed = slow
-  }
-  else if (speed == Stop) {
+    analogWrite(L9110_A_IB, PwmSlow);  // PWM speed = slow
+  } else if (speed == Stop) {
     printLine("Stop...");
     // Already done at top of function
   }
+}
+
+bool detectSensors() {
+  upperSensorDetected = !digitalRead(UpperSensorPin);
+  lowerSensorDetected = !digitalRead(LowerSensorPin);
+
+  if (upperSensorDetected != previousUpperSensorDetected) {
+    time_t t_now = now();
+    // printDateTime(t_now);
+    // printNoLine(" Upper sensor ");
+    if (upperSensorDetected) {
+      printNoLine("+"); //printLine("triggered");
+    } else {
+      printNoLine("-"); //printLine("released");
+    }
+    previousUpperSensorDetected = upperSensorDetected;
+  }
+  if (lowerSensorDetected != previousLowerSensorDetected) {
+    printNoLine("Lower sensor ");
+    if (lowerSensorDetected) {
+      printLine("triggered");
+    } else {
+      printLine("released");
+    }
+    previousLowerSensorDetected = lowerSensorDetected;
+  }
+
+  return true;
 }
 
 void handleWebClient() {
@@ -459,8 +473,7 @@ void handleWebClient() {
       clientActive = true;
       currentLine = "";
     }
-  }
-  else {
+  } else {
     if (client.connected()) {               // Check if the client is still connected
       if (client.available()) {             // If there's bytes to read from the client,
         char c = client.read();             // read a byte, then
@@ -481,104 +494,80 @@ void handleWebClient() {
             if (header.indexOf("GET /up1sec") >= 0) {
               printLine("Up for 1 second selected");
               webCommand = Move1SecUpCmd;
-            }
-            else if (header.indexOf("GET /down1sec") >= 0) {
+            } else if (header.indexOf("GET /down1sec") >= 0) {
               printLine("Down for 1 second selected");
               webCommand = Move1SecDownCmd;
-            }
-            else if (header.indexOf("GET /down") >= 0) {
+            } else if (header.indexOf("GET /down") >= 0) {
               printLine("Down selected");
               webCommand = DownCmd;
-            }
-            else if (header.indexOf("GET /up") >= 0) {
+            } else if (header.indexOf("GET /up") >= 0) {
               printLine("Up selected");
               webCommand = UpCmd;
-            }
-            else if (header.indexOf("GET /stop") >= 0) {
+            } else if (header.indexOf("GET /stop") >= 0) {
               printLine("Stop selected");
               webCommand = StopCmd;
-            }
-            else if (header.indexOf("GET /params") >= 0) {
+            } else if (header.indexOf("GET /params") >= 0) {
               // Find first parameter
               int begin = header.indexOf('?');
               int end = header.indexOf('&');
-              printNoLine("begin=");
-              printNoLine(String(begin));
-              printNoLine(" end=");
-              printLine(String(end));
               if (begin > -1 && end > begin + 1) {
                 String sub = header.substring(begin + 1, end);
-                printNoLine("Substring: ");
-                printLine(sub);
 
                 // Split parameter in name and value. Repeat for all parameters
                 bool dataPresent = true;
                 bool invalidParam = false;
+
+                UseDST = false;
+
                 do {
                   int equalsPos = sub.indexOf('=');
                   if (equalsPos > -1) {
                     String param = sub.substring(0, equalsPos);
                     String value = sub.substring(equalsPos + 1, sub.length());
-                    printNoLine("Parsed ");
-                    printNoLine(param);
-                    printNoLine(" = ");
-                    printLine(value);
 
                     // Check for and set the variables
                     long temp;
                     if (param.indexOf("Revert") == 0) {
-                      temp = value.toInt();
-                      if (temp == 0) dataPresent = false;
-                    }
-                    else if (param.indexOf("Timezone") == 0) {
+                      dataPresent = false;
+                    } else if (param.indexOf("Timezone") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) Timezone = temp;
-                    }
-                    else if (param.indexOf("CloseBeforeSunriseMinutes") == 0) {
+                    } else if (param.indexOf("UseDST") == 0) {
+                      UseDST = true;
+                    } else if (param.indexOf("CloseBeforeSunriseMinutes") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) CloseBeforeSunriseMinutes = temp;
-                    }
-                    else if (param.indexOf("HourOpen") == 0) {
+                    } else if (param.indexOf("HourOpen") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) HourOpen = temp;
-                    }
-                    else if (param.indexOf("MinuteOpen") == 0) {
+                    } else if (param.indexOf("MinuteOpen") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) MinuteOpen = temp;
-                    }
-                    else if (param.indexOf("WeekendHourOpen") == 0) {
+                    } else if (param.indexOf("WeekendHourOpen") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) WeekendHourOpen = temp;
-                    }
-                    else if (param.indexOf("WeekendMinuteOpen") == 0) {
+                    } else if (param.indexOf("WeekendMinuteOpen") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) WeekendMinuteOpen = temp;
-                    }
-                    else if (param.indexOf("CalibrateUsingSensor") == 0) {
+                    } else if (param.indexOf("CalibrateUsingSensor") == 0) {
                       temp = value.toInt();
                       CalibrateUsingSensor = (temp == 1);
-                    }
-                    else if (param.indexOf("UseLowerSensor") == 0) {
+                    } else if (param.indexOf("UseLowerSensor") == 0) {
                       temp = value.toInt();
                       UseLowerSensor = (temp == 1);
-                    }
-                    else if (param.indexOf("UpMoveMillis") == 0) {
+                    } else if (param.indexOf("UpMoveMillis") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) UpMoveMillis = temp;
-                    }
-                    else if (param.indexOf("DownMoveMillis") == 0) {
+                    } else if (param.indexOf("DownMoveMillis") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) DownMoveMillis = temp;
-                    }
-                    else if (param.indexOf("CalibrationMoveMillis") == 0) {
+                    } else if (param.indexOf("CalibrationMoveMillis") == 0) {
                       temp = value.toInt();
                       if (temp >= 0) CalibrationMoveMillis = temp;
-                    }
-                    else {
+                    } else {
                       invalidParam = true;
                     }
-                  }
-                  else {
+                  } else {
                     invalidParam = true;
                   }
 
@@ -591,21 +580,16 @@ void handleWebClient() {
                       end = header.length();
                     }
                   }
-                  printNoLine("begin=");
-                  printNoLine(String(begin));
-                  printNoLine(" end=");
-                  printLine(String(end));
 
                   if (end > begin + 1) {
                     sub = header.substring(begin, end);
-                    printNoLine("Substring: ");
-                    printLine(sub);
                   }
                 } while (!invalidParam && end > begin + 1);
 
                 // Put new settings into EEPROM
                 EEPROM.put(0, dataPresent);
                 EEPROM.put(1, Timezone);
+                EEPROM.put(3, UseDST);
                 EEPROM.put(5, CloseBeforeSunriseMinutes);
                 EEPROM.put(6, HourOpen);
                 EEPROM.put(7, MinuteOpen);
@@ -616,7 +600,7 @@ void handleWebClient() {
                 EEPROM.put(12, UpMoveMillis);
                 EEPROM.put(16, DownMoveMillis);
                 EEPROM.put(20, CalibrationMoveMillis);
-  
+
                 // Write the data to EEPROM
                 bool ok = EEPROM.commit();
                 printLine((ok) ? "Commit OK" : "Commit failed");
@@ -624,15 +608,15 @@ void handleWebClient() {
             }
 
             time_t t_now = now();
-            printDateTime(t_now);
-            printLine("");
+            //printDateTime(t_now);
+            //printLine("");
 
             // Display the HTML web page
             client.println("<!DOCTYPE html><html>");
             client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
             client.println("<link rel=\"icon\" href=\"data:,\">");
 
-            // CSS to style the on/off buttons 
+            // CSS to style the on/off buttons
             // Feel free to change the background-color and font-size attributes to fit your preferences
             client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
             client.println(".button { background-color: #195B6A; border: none; color: white; padding: 16px 40px;");
@@ -665,8 +649,7 @@ void handleWebClient() {
             client.print("<p>Today's opening time: ");
             if (dayOfWeek(now()) == 1 || dayOfWeek(now()) == 7) {
               sprintf(buf, "%02d:%02d", WeekendHourOpen, WeekendMinuteOpen);
-            }
-            else {
+            } else {
               sprintf(buf, "%02d:%02d", HourOpen, MinuteOpen);
             }
             client.print(buf);
@@ -683,66 +666,90 @@ void handleWebClient() {
               client.println("</p>");
             }
 
-            // 
+            //
             client.print("<p>State: ");
             switch (stateMachineState) {
-            case NotRunning:
-              client.print("NotRunning</p>");
-              break;
-            case Initial:
-              client.print("Initial</p>");
-              break;
-            case Up:
-              client.print("Up</p>");
-              client.println("<p><a href=\"/down\"><button class=\"button\">Down</button></a></p>");
-              client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
-              client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
-              break;
-            case MovingDown:
-              client.print("MovingDown</p>");
-              client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
-              break;
-            case Down:
-              client.print("Down</p>");
-              client.println("<p><a href=\"/up\"><button class=\"button\">Up</button></a></p>");
-              client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
-              client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
-              break;
-            case MovingUp:
-              client.print("MovingUp</p>");
-              client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
-              break;
-            case Moving1Sec:
-              client.print("Moving1Sec</p>");
-              break;
-            default:
-              client.print("Unknown</p>");
-              break;
+              case NotRunning:
+                client.print("NotRunning</p>");
+                break;
+              case Initial:
+                client.print("Initial</p>");
+                break;
+              case Up:
+                client.print("Up</p>");
+                client.println("<p><a href=\"/down\"><button class=\"button\">Down</button></a></p>");
+                client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
+                client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
+                break;
+              case MovingDown:
+                client.print("MovingDown</p>");
+                client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
+                break;
+              case Down:
+                client.print("Down</p>");
+                client.println("<p><a href=\"/up\"><button class=\"button\">Up</button></a></p>");
+                client.println("<p><a href=\"/up1sec\"><button class=\"button\">1 Second Up</button></a></p>");
+                client.println("<p><a href=\"/down1sec\"><button class=\"button\">1 Second Down</button></a></p>");
+                break;
+              case MovingUp:
+                client.print("MovingUp</p>");
+                client.println("<p><a href=\"/stop\"><button class=\"button\">Stop</button></a></p>");
+                break;
+              case Moving1Sec:
+                client.print("Moving1Sec</p>");
+                break;
+              default:
+                client.print("Unknown</p>");
+                break;
             }
             client.println("<p><a href=\"/\"><button class=\"button\">Refresh</button></a></p><br>");
 
             // Print the form for uploading settings
-            int revert = 1;
             client.println("<form action=\"/params\">");
-            client.println("Enter 0 to revert to default values after reset:<input type=\"text\" name=\"Revert\" value=\""); client.print(revert); client.print("\"><br>");
-            client.println("Timezone:<input type=\"text\" name=\"Timezone\" value=\""); client.print(Timezone); client.print("\"><br>");
-            client.println("CloseBeforeSunriseMinutes:<input type=\"text\" name=\"CloseBeforeSunriseMinutes\" value=\""); client.print(CloseBeforeSunriseMinutes); client.print("\"><br>");
-            client.println("HourOpen:<input type=\"text\" name=\"HourOpen\" value=\""); client.print(HourOpen); client.print("\"><br>");
-            client.println("MinuteOpen:<input type=\"text\" name=\"MinuteOpen\" value=\""); client.print(MinuteOpen); client.print("\"><br>");
-            client.println("WeekendHourOpen:<input type=\"text\" name=\"WeekendHourOpen\" value=\""); client.print(WeekendHourOpen); client.print("\"><br>");
-            client.println("WeekendMinuteOpen:<input type=\"text\" name=\"WeekendMinuteOpen\" value=\""); client.print(WeekendMinuteOpen); client.print("\"><br>");
-            client.println("CalibrateUsingSensor:<input type=\"text\" name=\"CalibrateUsingSensor\" value=\""); client.print(CalibrateUsingSensor); client.print("\"><br>");
-            client.println("UseLowerSensor:<input type=\"text\" name=\"UseLowerSensor\" value=\""); client.print(UseLowerSensor); client.print("\"><br>");
-            client.println("UpMoveMillis:<input type=\"text\" name=\"UpMoveMillis\" value=\""); client.print(UpMoveMillis); client.print("\"><br>");
-            client.println("DownMoveMillis:<input type=\"text\" name=\"DownMoveMillis\" value=\""); client.print(DownMoveMillis); client.print("\"><br>");
-            client.println("CalibrationMoveMillis:<input type=\"text\" name=\"CalibrationMoveMillis\" value=\""); client.print(CalibrationMoveMillis); client.print("\"><br>");
-            client.println("<input type=\"submit\" value=\"Submit\">");
+            client.println("<p>Revert to default values after reset:<input type=\"checkbox\" name=\"Revert\"></p>");
+            client.print("<p>Timezone:<input type=\"text\" name=\"Timezone\" value=\"");
+            client.print(Timezone);
+            client.println("\"></p>");
+            client.print("<p>Observe DST:<input type=\"checkbox\" name=\"UseDST\"");
+            if (UseDST) client.print(" checked");
+            client.println("></p>");
+            client.print("<p>CloseBeforeSunriseMinutes:<input type=\"text\" name=\"CloseBeforeSunriseMinutes\" value=\"");
+            client.print(CloseBeforeSunriseMinutes);
+            client.println("\"></p>");
+            client.print("<p>HourOpen:<input type=\"text\" name=\"HourOpen\" value=\"");
+            client.print(HourOpen);
+            client.println("\"></p>");
+            client.print("<p>MinuteOpen:<input type=\"text\" name=\"MinuteOpen\" value=\"");
+            client.print(MinuteOpen);
+            client.println("\"></p>");
+            client.print("<p>WeekendHourOpen:<input type=\"text\" name=\"WeekendHourOpen\" value=\"");
+            client.print(WeekendHourOpen);
+            client.println("\"></p>");
+            client.print("<p>WeekendMinuteOpen:<input type=\"text\" name=\"WeekendMinuteOpen\" value=\"");
+            client.print(WeekendMinuteOpen);
+            client.println("\"></p>");
+            client.print("<p>CalibrateUsingSensor:<input type=\"text\" name=\"CalibrateUsingSensor\" value=\"");
+            client.print(CalibrateUsingSensor);
+            client.println("\"></p>");
+            client.print("<p>UseLowerSensor:<input type=\"text\" name=\"UseLowerSensor\" value=\"");
+            client.print(UseLowerSensor);
+            client.println("\"></p>");
+            client.print("<p>UpMoveMillis:<input type=\"text\" name=\"UpMoveMillis\" value=\"");
+            client.print(UpMoveMillis);
+            client.println("\"></p>");
+            client.print("<p>DownMoveMillis:<input type=\"text\" name=\"DownMoveMillis\" value=\"");
+            client.print(DownMoveMillis);
+            client.println("\"></p>");
+            client.print("<p>CalibrationMoveMillis:<input type=\"text\" name=\"CalibrationMoveMillis\" value=\"");
+            client.print(CalibrationMoveMillis);
+            client.println("\"></p>");
+            client.println("<p><input type=\"submit\" value=\"Submit\"></p>");
             client.println("</form>");
 
             client.print("<p>");
             client.print(debugText);
             client.println("</p>");
-              
+
             client.println("</body></html>");
 
             // The HTTP response ends with another blank line
@@ -757,24 +764,20 @@ void handleWebClient() {
             printLine("");
 
             clientActive = false;
-          }
-          else { // If you got a newline, then clear currentLine
+          } else {  // If you got a newline, then clear currentLine
             currentLine = "";
           }
+        } else if (c != '\r') {  // If you got anything else but a carriage return character,
+          currentLine += c;      // add it to the end of the currentLine
         }
-        else if (c != '\r') {  // If you got anything else but a carriage return character,
-          currentLine += c;    // add it to the end of the currentLine
-        }
-      }
-      else {
+      } else {
         // The client is connected but no data is available. Time out if this takes too long.
         if (now() > clientConnectedAt + webConnectPeriod) {
           clientActive = false;
           printLine("Client connection timed out");
         }
       }
-    }
-    else {
+    } else {
       clientActive = false;
       printLine("Client no longer connected");
     }
@@ -785,21 +788,20 @@ void handleWebClient() {
 void setSunriseSunsetClosingTime() {
   // Initialize sunMoon
   sm.init(Timezone, Latitude, Longitude);
-  sunRise = sm.sunRise();
-  sunSet = sm.sunSet();
+  sunRise = sm.sunRise() + DST * 60;
+  sunSet = sm.sunSet() + DST * 60;
   printNoLine("Today's sunrise and sunset: ");
   printDateTime(sunRise);
   printNoLine(", ");
   printDateTime(sunSet);
   printLine("");
 
-  // The time for closing the door is <CloseBeforeSunriseMinutes> before sunset 
+  // The time for closing the door is <CloseBeforeSunriseMinutes> before sunset
   // or opening time, whichever comes first.
   tmElements_t openingTimeElements;
   if (dayOfWeek(now()) > 1 && dayOfWeek(now()) < 7) {
     openingTimeElements = { second(), MinuteOpen, HourOpen, weekday(), day(), month(), year() - 1970 };
-  }
-  else {
+  } else {
     openingTimeElements = { second(), WeekendMinuteOpen, WeekendHourOpen, weekday(), day(), month(), year() - 1970 };
   }
   time_t openingTime = makeTime(openingTimeElements);
@@ -807,8 +809,7 @@ void setSunriseSunsetClosingTime() {
   if (openingTime < sunRise) {
     printLine("The time for opening is before sunrise");
     closingTime = openingTime - (CloseBeforeSunriseMinutes * 60);
-  }
-  else {
+  } else {
     closingTime = sunRise - (CloseBeforeSunriseMinutes * 60);
   }
 
@@ -817,37 +818,9 @@ void setSunriseSunsetClosingTime() {
   printLine("");
 }
 
-bool detectSensors() {
-  upperSensorDetected = !digitalRead(UpperSensorPin);
-  lowerSensorDetected = !digitalRead(LowerSensorPin);
-
-  if (upperSensorDetected != previousUpperSensorDetected) {
-    printNoLine("Upper sensor ");
-    if (upperSensorDetected) {
-      printLine("triggered");
-    }
-    else {
-      printLine("released");
-    }
-    previousUpperSensorDetected = upperSensorDetected;
-  }
-  if (lowerSensorDetected != previousLowerSensorDetected) {
-    printNoLine("Lower sensor ");
-    if (lowerSensorDetected) {
-      printLine("triggered");
-    }
-    else {
-      printLine("released");
-    }
-    previousLowerSensorDetected = lowerSensorDetected;
-  }
-
-  return true;
-}
-
 void sendEmail(int selectMessage) {
-  ESP_Mail_Session session; // Session config data
-  SMTP_Message message;     // Message class
+  ESP_Mail_Session session;  // Session config data
+  SMTP_Message message;      // Message class
 
   // Set the session config
   session.server.host_name = smtpServer;
@@ -865,14 +838,13 @@ void sendEmail(int selectMessage) {
   // Create raw text message
   if (selectMessage == 1) {
     message.text.content = "The clock could not be set.";
-  }
-  else if (selectMessage == 2) {
+  } else if (selectMessage == 2) {
     message.text.content = "Calibration failed.";
   }
 
   message.text.charSet = "us-ascii";
   message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
-  
+
   message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
   message.response.notify = esp_mail_smtp_notify_success | esp_mail_smtp_notify_failure | esp_mail_smtp_notify_delay;
 
@@ -888,12 +860,12 @@ void sendEmail(int selectMessage) {
 }
 
 // Callback function to get the email sending status
-void smtpCallback(SMTP_Status status){
+void smtpCallback(SMTP_Status status) {
   // Print the current status
   printLine(status.info());
 
   /* Print the sending result */
-  if (status.success()){
+  if (status.success()) {
     printLine("Mail sent OK");
   }
 }
@@ -915,17 +887,23 @@ void loop() {
           printNoLine("DNS lookup failed for ");
           printLine(NtpServer);
         }
-      }
-      else {
+      } else {
         // Check for received packets
         time_t epoch = getNtpTime();
         if (epoch > 0) {
-          calcDST();
           printNoLine("Daylight Saving Time ");
-          if (DST == 0) {
-            printNoLine("not ");
+          if (UseDST) {
+            printNoLine("observed ");
+            if (dstActive(epoch)) {
+              DST = 60;
+              printLine("and active");
+            } else {
+              DST = 0;
+              printLine("but not active");
+            }
+          } else {
+            printLine("not observed");
           }
-          printLine("active");
 
           printNoLine("Setting system time to UTC + ");
           printNoLine(String(Timezone + DST));
@@ -936,18 +914,18 @@ void loop() {
           setSunriseSunsetClosingTime();
 
           // Time was set, start the state machine for the door
-          stateMachineState = Initial;
-          stateChanged = (stateMachineState != previousStateMachineState);
-          previousStateMachineState = stateMachineState;
+          if (stateMachineState == NotRunning) {
+            stateMachineState = Initial;
+            stateChanged = true;
+            previousStateMachineState = stateMachineState;
+          }
         }
       }
       lastSecond = second();
-    }
-    else if (now() > updateTimeStarted + 3600) {
+    } else if (now() > updateTimeStarted + 3600) {
       // After an hour, try it again.
       updateTimeStarted = now();
-    }
-    else if (now() > updateTimeStarted + UpdateTimeTimeout) {
+    } else if (now() > updateTimeStarted + UpdateTimeTimeout) {
       // No time packet was received, send a warning email once.
       // Chances are the internet connection is down anyway.
       if (!emailSent) {
@@ -955,10 +933,11 @@ void loop() {
         sendEmail(1);
       }
     }
-  }
-  else {
-    // Make sure the clock and sunrise/sunset are updated once a week on wednesdays afternoons
-    if (ntpTimeSet && dayOfWeek(now()) == 4 && hour() == 12 && minute() == 5 && second() == 59) {
+  } else {
+    // Make sure the clock is updated once a week on Sunday mornings.
+    // This also allows for DST to be set correctly. Note that time can move
+    // back or forward by one hour.
+    if (dayOfWeek(now()) == 1 && hour() == 1 && minute() == 10 && second() == 0) {
       printNoLine("Invalidating time at ");
       printDateTime(now());
       printLine("");
@@ -966,6 +945,20 @@ void loop() {
       updateTimeStarted = now();
       emailSent = false;
     }
+  }
+
+  time_t t_now = now();  // The number of seconds since Jan 1 1970
+
+  // Every day at two thirty a.m. calculate the next sunrise and sunset and the time for closing the door
+  if (!settingSunRiseSunSet && hour() == 2 && minute() == 30 && second() == 0) {
+    settingSunRiseSunSet = true;
+    printNoLine("Calculating sunrise and sunset at ");
+    printDateTime(t_now);
+    printLine("");
+
+    setSunriseSunsetClosingTime();
+  } else if (settingSunRiseSunSet && second() != 0) {
+    settingSunRiseSunSet = false;
   }
 
   // Web server stuff. Only run in stable state, because the state can be changed by the user.
@@ -978,38 +971,22 @@ void loop() {
     detectSensors();
   }
 
-  time_t t_now = now();   // The number of seconds since Jan 1 1970
-
-  // Every day at two a.m. calculate DST, the next sunrise and sunset and the time for closing the door
-  if (!settingSunRiseSunSet && hour() == 2 && minute() == 0 && second() == 0) {
-    settingSunRiseSunSet = true;
-    printLine("Calculating sunrise and sunset at ");
-    printDateTime(t_now);
-    printLine("");
-
-    calcDST();
-    setSunriseSunsetClosingTime();
-  }
-  else if (settingSunRiseSunSet && second() != 0) {
-    settingSunRiseSunSet = false;
-  }
-
   // Update the temperature every LoopPeriod seconds
   if (Bme280Present && (t_now >= previousCheckAt + LoopPeriod)) {
     previousCheckAt = t_now;
 
     // Print timer interrupt count and time
-    Serial.print("Reading BME280 at ");
-    printDateTime(now());
-    Serial.println();
+    // printNoLine("Reading BME280 at ");
+    // printDateTime(now());
+    // printLine("");
 
     // Start measurement
     bme.takeForcedMeasurement();
 
     // Temperature
-    temperature = bme.readTemperature() - 2.4;    // Correction for my BME280
+    temperature = bme.readTemperature() - 2;      // Correction for my BME280
     humidity = bme.readHumidity() - 9.0;          // Correction for my BME280
-    pressure = bme.readPressure() / 100.0F + 2.1; // Correction for my BME280
+    pressure = bme.readPressure() / 100.0F;       // Correction for my BME280
     printf("Temperature: %0.1f*C, humidity: %0.f%%, pressure: %0.1f hPa\r\n", temperature, humidity, pressure);
   }
 
@@ -1017,257 +994,243 @@ void loop() {
   // The state machine for controlling the door of the chicken coop //
   //******************************************************************
 
-  switch (stateMachineState)
-  {
-  //==============================================================
-  // State 'Initial' 
-  //==============================================================
-  case Initial:
+  switch (stateMachineState) {
+    //==============================================================
+    // State 'Initial'
+    //==============================================================
+    case Initial:
 
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: Initial");
-    }
-
-    // Transitions
-    if (!stateChanged) {
-      // Because we clear the upper sensor after moving up, only use the
-      // (optional) lower sensor to determine the position of the door
-      if (UseLowerSensor && lowerSensorDetected) {
-        stateMachineState = Down;
-      }
-      else {
-        stateMachineState = Up;
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'Up' 
-  //==============================================================
-  case Up:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: Up");
-      moveDoor(Stop, DownDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      // In the night, when there is no interference from the sun on the IR sensor, the
-      // position of the door is calibrated by moving it up until the sensor is triggered.
-      if (CalibrateUsingSensor && !calibrationFailed && !doorCalibrated &&
-          hour() == HourCalibration && minute() == MinuteCalibration) {
-        if (upperSensorDetected) {
-          // Calibrate by moving down a little bit so the sensor isn't triggered
-          stateMachineState = ClearingSensor;
-        }
-        else {
-          // Move up until the sensor is triggered
-          stateMachineState = MovingIntoSensor;
-        }
-        doorCalibrated = true;
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: Initial");
       }
 
-      // Close the door if the temperature goes below the treshold and it is night OR
-      // when it is just before sunset and we want to keep the chicken inside a bit longer
-      if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sunSet || t_now < sunRise)) ||
-        (UseClock && (t_now >= closingTime) && (t_now < closingTime + 4)) ||
-        webCommand == DownCmd)
-      {
-        webCommand = NoCmd;
-        stateMachineState = MovingDown;
-      }
-      else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
-        prevState = Up;
-        stateMachineState = Moving1Sec;
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'MovingIntoSensor'
-  // This state if for calibrating the position of the door using
-  // the upper sensor. The door will move up a bit to find the
-  // sensor. If the sensor is not found, the calibration
-  // procedure is aborted and not done again until a reboot.
-  //==============================================================
-  case MovingIntoSensor:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: MovingIntoSensor");
-      startMovingMillis = millis();
-      moveDoor(Slow, UpDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if (upperSensorDetected) {
-        moveDoor(Stop, DownDir);
-        stateMachineState = ClearingSensor;
-      }
-      else if (millis() - startMovingMillis > CalibrationMoveMillis) {
-        printLine("Calibration timed out");
-        stateMachineState = Up;
-        calibrationFailed = true;
-        moveDoor(Stop, DownDir); // Just in case something goes wrong when sending the email
-        sendEmail(2);
-      }
-    }
-    break;
-    
-  //==============================================================
-  // State 'ClearingSensor' 
-  //==============================================================
-  case ClearingSensor:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: ClearingSensor");
-      startMovingMillis = millis();
-      moveDoor(Slow, DownDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if (!upperSensorDetected) {
-        stateMachineState = Up;
-      }
-      else if (millis() - startMovingMillis > CalibrationMoveMillis) {
-        printLine("Calibration timed out");
-        stateMachineState = Up;
-        calibrationFailed = true;
-        moveDoor(Stop, DownDir); // Just in case something goes wrong when sending the email
-        sendEmail(2);
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'MovingDown' 
-  //==============================================================
-  case MovingDown:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: MovingDown");
-
-      startMovingMillis = millis();
-      moveDoor(Fast, DownDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if ((UseLowerSensor && lowerSensorDetected) ||
-        (millis() - startMovingMillis > DownMoveMillis) ||
-        (webCommand == StopCmd))
-      {
-        webCommand = NoCmd;
-        stateMachineState = Down;
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'Down' 
-  //==============================================================
-  case Down:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: Down");
-      moveDoor(Stop, DownDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if ((UseTemperature && ((temperature > ClosingTemperature) || (t_now > sunRise && t_now < sunSet))) ||
-          (UseClock && (dayOfWeek(now()) > 1) && (dayOfWeek(now()) < 7) && (hour() == HourOpen) && (minute() == MinuteOpen)) ||
-          (UseClock && (dayOfWeek(now()) == 1 || dayOfWeek(now()) == 7) && (hour() == WeekendHourOpen) && (minute() == WeekendMinuteOpen)) ||
-          (webCommand == UpCmd))
-      {
-        webCommand = NoCmd;
-        stateMachineState = MovingUp;
-      }
-      else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
-        prevState = Down;
-        stateMachineState = Moving1Sec;
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'MovingUp' 
-  //==============================================================
-  case MovingUp:
-
-    // Actions on entry
-    if (stateChanged) {
-      printLine("State: MovingUp");
-      startMovingMillis = millis();
-      moveDoor(Fast, UpDir);
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if ((millis() - startMovingMillis > UpMoveMillis) ||
-          (webCommand == StopCmd))
-      {
-        webCommand = NoCmd;
-        stateMachineState = Up;
-        doorCalibrated = false;
-      }
-    }
-    break;
-
-  //==============================================================
-  // State 'Moving1Sec' 
-  //==============================================================
-  case Moving1Sec:
-
-    // Actions on entry
-    if (stateChanged) {
-      printNoLine("State: Moving1Sec ");
-      if (webCommand == Move1SecUpCmd) {
-        printLine("Up");
-        moveDoor(Fast, UpDir);
-      }
-      else {
-        printLine("Down");
-        moveDoor(Fast, DownDir);
-      }
-      webCommand = NoCmd;
-      startMovingMillis = millis();
-    }
-
-    // Continuous actions
-
-    // Transitions
-    if (!stateChanged) {
-      if (millis() - startMovingMillis > 1000) {
-        if (prevState == Up) {
+      // Transitions
+      if (!stateChanged) {
+        // Because we clear the upper sensor after moving up, only use the
+        // (optional) lower sensor to determine the position of the door
+        if (UseLowerSensor && lowerSensorDetected) {
+          stateMachineState = Down;
+        } else {
           stateMachineState = Up;
         }
-        else {
+      }
+      break;
+
+    //==============================================================
+    // State 'Up'
+    //==============================================================
+    case Up:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: Up");
+        moveDoor(Stop, DownDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        // In the night, when there is no interference from the sun on the IR sensor, the
+        // position of the door is calibrated by moving it up until the sensor is triggered.
+        if (CalibrateUsingSensor && !calibrationFailed && !doorCalibrated && hour() == HourCalibration && minute() == MinuteCalibration) {
+          if (upperSensorDetected) {
+            // Calibrate by moving down a little bit so the sensor isn't triggered
+            stateMachineState = ClearingSensor;
+          } else {
+            // Move up until the sensor is triggered
+            stateMachineState = MovingIntoSensor;
+          }
+          doorCalibrated = true;
+        }
+
+        // Close the door if the temperature goes below the treshold and it is night OR
+        // when it is just before sunset and we want to keep the chicken inside a bit longer
+        if ((UseTemperature && (temperature < ClosingTemperature) && (t_now > sunSet || t_now < sunRise)) || (UseClock && (t_now >= closingTime) && (t_now < closingTime + 4)) || webCommand == DownCmd) {
+          webCommand = NoCmd;
+          stateMachineState = MovingDown;
+        } else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
+          prevState = Up;
+          stateMachineState = Moving1Sec;
+        }
+      }
+      break;
+
+    //==============================================================
+    // State 'MovingIntoSensor'
+    // This state if for calibrating the position of the door using
+    // the upper sensor. The door will move up a bit to find the
+    // sensor. If the sensor is not found, the calibration
+    // procedure is aborted and not done again until a reboot.
+    //==============================================================
+    case MovingIntoSensor:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: MovingIntoSensor");
+        startMovingMillis = millis();
+        moveDoor(Slow, UpDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if (upperSensorDetected) {
+          moveDoor(Stop, DownDir);
+          stateMachineState = ClearingSensor;
+        } else if (millis() - startMovingMillis > CalibrationMoveMillis) {
+          printLine("Calibration timed out");
+          stateMachineState = Up;
+          calibrationFailed = true;
+          moveDoor(Stop, DownDir);  // Just in case something goes wrong when sending the email
+          sendEmail(2);
+        }
+      }
+      break;
+
+    //==============================================================
+    // State 'ClearingSensor'
+    //==============================================================
+    case ClearingSensor:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: ClearingSensor");
+        startMovingMillis = millis();
+        moveDoor(Slow, DownDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if (!upperSensorDetected) {
+          stateMachineState = Up;
+        } else if (millis() - startMovingMillis > CalibrationMoveMillis) {
+          printLine("Calibration timed out");
+          stateMachineState = Up;
+          calibrationFailed = true;
+          moveDoor(Stop, DownDir);  // Just in case something goes wrong when sending the email
+          sendEmail(2);
+        }
+      }
+      break;
+
+    //==============================================================
+    // State 'MovingDown'
+    //==============================================================
+    case MovingDown:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: MovingDown");
+
+        startMovingMillis = millis();
+        moveDoor(Fast, DownDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if ((UseLowerSensor && lowerSensorDetected) || (millis() - startMovingMillis > DownMoveMillis) || (webCommand == StopCmd)) {
+          webCommand = NoCmd;
           stateMachineState = Down;
         }
       }
-    }
-    break;
+      break;
+
+    //==============================================================
+    // State 'Down'
+    //==============================================================
+    case Down:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: Down");
+        moveDoor(Stop, DownDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if ((UseTemperature && ((temperature > ClosingTemperature) || (t_now > sunRise && t_now < sunSet))) || (UseClock && (dayOfWeek(now()) > 1) && (dayOfWeek(now()) < 7) && (hour() == HourOpen) && (minute() == MinuteOpen)) || (UseClock && (dayOfWeek(now()) == 1 || dayOfWeek(now()) == 7) && (hour() == WeekendHourOpen) && (minute() == WeekendMinuteOpen)) || (webCommand == UpCmd)) {
+          webCommand = NoCmd;
+          stateMachineState = MovingUp;
+        } else if (webCommand == Move1SecUpCmd || webCommand == Move1SecDownCmd) {
+          prevState = Down;
+          stateMachineState = Moving1Sec;
+        }
+      }
+      break;
+
+    //==============================================================
+    // State 'MovingUp'
+    //==============================================================
+    case MovingUp:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printLine(" State: MovingUp");
+        startMovingMillis = millis();
+        moveDoor(Fast, UpDir);
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if ((millis() - startMovingMillis > UpMoveMillis) || (webCommand == StopCmd)) {
+          webCommand = NoCmd;
+          stateMachineState = Up;
+          doorCalibrated = false;
+        }
+      }
+      break;
+
+    //==============================================================
+    // State 'Moving1Sec'
+    //==============================================================
+    case Moving1Sec:
+
+      // Actions on entry
+      if (stateChanged) {
+        printDateTime(t_now);
+        printNoLine(" State: Moving1Sec ");
+        if (webCommand == Move1SecUpCmd) {
+          printLine("Up");
+          moveDoor(Fast, UpDir);
+        } else {
+          printLine("Down");
+          moveDoor(Fast, DownDir);
+        }
+        webCommand = NoCmd;
+        startMovingMillis = millis();
+      }
+
+      // Continuous actions
+
+      // Transitions
+      if (!stateChanged) {
+        if (millis() - startMovingMillis > 1000) {
+          if (prevState == Up) {
+            stateMachineState = Up;
+          } else {
+            stateMachineState = Down;
+          }
+        }
+      }
+      break;
   }
 
   // Update state variables
@@ -1276,8 +1239,7 @@ void loop() {
 
   if (clientActive) {
     delay(1);
-  }
-  else {
+  } else {
     delay(10);
   }
 }
